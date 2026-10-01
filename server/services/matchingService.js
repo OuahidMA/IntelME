@@ -364,22 +364,4 @@ export function matchVerdict(score) {
   return "Reach";
 }
 
-/**
- * Flattens a stored analysis into the rows the "My job matches" table needs,
- * without shipping the whole document.
- */
-export function summariseMatch(job) {
-  return {
-    id: job._id.toString(),
-    jobTitle: job.jobTitle,
-    company: job.company,
-    score: job.score,
-    verdict: job.verdict,
-    resume: job.resume?.toString?.() ?? job.resume,
-    createdAt: job.createdAt,
-    matchingSkills: (job.matchingSkills ?? []).map((row) => row.name),
-    missingSkills: (job.missingSkills ?? []).map((row) => row.name),
-  };
-}
-
 export default scoreJobMatch;

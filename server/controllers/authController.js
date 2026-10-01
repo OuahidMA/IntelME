@@ -2,7 +2,6 @@ import bcrypt from "bcryptjs";
 
 import User from "../models/User.js";
 import { asyncHandler } from "../middleware/errorMiddleware.js";
-import { removeStoredFile } from "../middleware/uploadMiddleware.js";
 import { signToken } from "../utils/jwt.js";
 import {
   ValidationError,
@@ -25,9 +24,9 @@ const BAD_CREDENTIALS = "Email or password incorrect";
  * signed JWT. The plaintext password is never written anywhere.
  *
  * This is the only write that creates anything in the database: one document in
- * the `users` collection, with its resume, analysis and job-match arrays empty.
- * There is no second collection to initialise, and nothing else to cascade when
- * the account is later deleted.
+ * the `users` collection, with a name, an email and that hash. Nothing about a
+ * CV is filed here — the browser keeps the versions, the analyses and the matches,
+ * scoped to the id this response returns.
  */
 export const register = asyncHandler(async (req, res) => {
   const { name, email, password } = validateRegister(req.body);
@@ -144,20 +143,16 @@ export const changePassword = asyncHandler(async (req, res) => {
 /**
  * DELETE /api/auth/me
  *
- * Removes the account. Resumes, analyses and job matches are subdocuments of
- * that account, so they go with it in a single delete — there is no cascade to
- * run and no row left pointing at a user that no longer exists. Only the files
- * on disk are still separate, and each is unlinked with the resume it belonged
- * to.
+ * Removes the account, which is three fields in one document. There is no
+ * cascade: no CV, analysis or job match was ever written here, and the uploaded
+ * files were unlinked as soon as they were parsed, so this delete is genuinely
+ * the whole of what the server holds.
+ *
+ * The browser wipes its own copy of the versions and matches at the same moment
+ * — see `AuthContext.deleteAccount` — because that is where they live.
  */
 export const deleteMe = asyncHandler(async (req, res) => {
-  const files = req.user.resumes.map((resume) => resume.filePath).filter(Boolean);
-
   await req.user.deleteOne();
-
-  for (const filePath of files) {
-    removeStoredFile(filePath);
-  }
 
   res.json({ success: true, message: "Account deleted." });
 });

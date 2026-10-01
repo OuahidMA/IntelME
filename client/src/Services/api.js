@@ -1,25 +1,25 @@
+import { API_BASE_URL } from "./config"
+
 /**
  * The intelme data layer.
  *
- * Every call here is a real `fetch` against the Express API. Components never
- * see a response from this module directly: the server documents are mapped
- * onto the shapes the UI was built around (`analysis.atsScore`,
- * `match.overallScore`, and so on), so the pages stay unchanged while the data
- * behind them is now persisted, scored and explained server-side.
+ * Every call here is a real `fetch` against the Express API, and every one of
+ * them is stateless: the browser holds the CVs, so it sends whatever the call
+ * needs and the server answers with a result. Nothing is fetched back that was
+ * not just asked for, and nothing is stored on the way through.
  *
- * The token is the only thing kept in `localStorage`. There is no server-side
- * session to revoke, so a stored JWT is what the app sends as a bearer token on
- * every protected route.
+ * Server documents are mapped onto the shapes the UI was built around
+ * (`analysis.atsScore`, `match.overallScore`, and so on) so the pages stay
+ * unchanged while the data behind them is now owned by the browser rather than
+ * by a database — see `localStore.js` for what is kept, and where.
+ *
+ * Two things are stored in `localStorage`: the JWT, and the user's own documents.
+ * There is no server-side session to revoke, so a stored JWT is what the app
+ * sends as a bearer token on every protected route.
+ *
+ * The backend origin comes from `./config.js` and nowhere else — there is no URL
+ * literal in this file — so switching environments is `VITE_API_URL` alone.
  */
-
-/**
- * In a Vite build this is statically replaced. The optional chain matters: this
- * module is also imported directly by `scripts/checkClient.mjs` under plain
- * Node, where `import.meta.env` does not exist at all.
- */
-const API_BASE = (
-  import.meta.env?.VITE_API_URL ?? "http://localhost:5000/api"
-).replace(/\/$/, "")
 
 const TOKEN_KEY = "intelme.token"
 
@@ -99,7 +99,7 @@ async function request(path, { method = "GET", body, auth = true, signal } = {})
 
   let response
   try {
-    response = await fetch(`${API_BASE}${path}`, {
+    response = await fetch(`${API_BASE_URL}${path}`, {
       method,
       headers,
       signal,
@@ -129,9 +129,9 @@ async function request(path, { method = "GET", body, auth = true, signal } = {})
       // `details` here — the name this class uses internally — found nothing,
       // and every field message the server wrote was dropped on the floor.
       payload?.errors,
-      // The whole body, so a caller can recover resources the server managed to
-      // save before it hit the failure — an upload whose analysis failed still
-      // stored the file, and re-uploading would duplicate it.
+      // The whole body, so a caller can recover a result the server managed to
+      // produce before it hit a failure — an upload whose analysis failed still
+      // returned the text it parsed, and re-uploading would duplicate the version.
       payload,
     )
   }
@@ -228,12 +228,16 @@ function toChecks(breakdown) {
 }
 
 /**
- * Server analysis + its resume → the shape `Analysis.jsx` and `Dashboard.jsx`
- * read. The extra keys past what those two pages use are kept deliberately: the
- * breakdown, the extracted sections and the recommendations are what make the
- * score explainable rather than a bare number.
+ * Server analysis + the version it came from → the shape `Analysis.jsx` and
+ * `Dashboard.jsx` read. The extra keys past what those two pages use are kept
+ * deliberately: the breakdown, the extracted sections and the recommendations are
+ * what make the score explainable rather than a bare number.
+ *
+ * Exported because the provider maps the *stored* analysis of whichever version
+ * is selected, including one produced by a re-run, against a resume record that
+ * never came back from the server at all.
  */
-function mapAnalysis(analysis, resume) {
+export function mapAnalysis(analysis, resume) {
   if (!analysis) return null
 
   const source = analysis
@@ -341,7 +345,7 @@ export function toMatchResult(job, analysis) {
 
   return {
     id: job.id ?? null,
-    resumeId: job.resume ?? null,
+    resumeId: job.resumeId ?? job.resume ?? null,
     jobTitle: job.jobTitle || "Untitled role",
     company: job.company || "",
     jobDescription: job.jobDescription ?? "",
@@ -363,18 +367,20 @@ export function toMatchResult(job, analysis) {
   }
 }
 
-/** Server resume → the `{ name, size, type }` chip the dashboard shows. */
-function mapResumeMeta(resume) {
+/**
+ * The `{ name, size, type }` chip the dashboard shows, from the resume record
+ * the server returned for one upload. Used once, when the version is written to
+ * this browser for the first time.
+ */
+export function mapResumeMeta(resume) {
   if (!resume) return null
   return {
-    id: resume.id ?? null,
     name: resume.originalName ?? "resume",
     size: resume.fileSize ?? 0,
     type: (resume.fileType ?? "").toUpperCase(),
     label: resume.label ?? "Main",
-    status: resume.status,
     extractionMethod: resume.extractionMethod,
-    fileUrl: resume.fileUrl,
+    characters: resume.characters ?? 0,
     createdAt: resume.createdAt,
   }
 }
@@ -469,11 +475,13 @@ export async function changePassword({ currentPassword, newPassword }) {
 /**
  * DELETE /api/auth/me
  *
- * Removes the account document. The resumes, analyses and job matches are
- * subdocuments of that account, so the single delete takes all of them with it,
- * along with the uploaded files on disk. The stored token is dropped here as
- * well: the account it points at no longer exists, so every later call would
- * come back 401.
+ * Removes the account document — a name, an email and a password hash, which is
+ * all the database holds. Nothing here cascades, because nothing about a CV was
+ * ever written to it.
+ *
+ * The stored token is dropped here, and `AuthContext.deleteAccount` clears the
+ * browser's own copy of the versions and matches: the account it belonged to no
+ * longer exists, so the data has to go with it.
  */
 export async function deleteAccount() {
   const data = await request("/auth/me", { method: "DELETE" })
@@ -492,16 +500,28 @@ export function hasStoredToken() {
 
 /* ------------------------------------------------------------------ *
  * Resumes and versions
+ *
+ * Four stateless calls. Each one is given whatever it needs and returns a result;
+ * none of them reads a stored document, because there is nothing stored.
  * ------------------------------------------------------------------ */
 
 /**
- * Uploads a file and runs the analysis in the same call.
+ * Sends a file up, gets its text and its analysis back, and stores nothing.
  *
- * When extraction worked but the AI call did not, the server still stores the
- * file and answers 502 with the saved resume and `canRetry: true`. That resume
- * is returned here rather than thrown away: the version is real, and re-uploading
- * it would leave the user with a duplicate. The caller gets `analysis: null` and
- * can re-run the analysis on the version that already exists.
+ * The server deletes the upload as soon as it has parsed it, so the response is
+ * the only copy: `resume.extractedText` is the CV, and it has to be kept by
+ * whoever made this call. `localStore.js` is that whoever.
+ *
+ * When the text was recovered but the AI call did not succeed, the server
+ * answers 502 with the resume it produced and `canRetry: true`. That resume is
+ * returned here rather than thrown away: the version is real and useful, and
+ * re-uploading would leave the user with a duplicate. The caller gets
+ * `analysis: null` and can re-run the analysis on the text it already holds.
+ *
+ * Both `resume` and `analysis` are returned in the server's own shape, not the
+ * one the pages read. They are stored as-is — the analysis has to travel back to
+ * the server intact to be scored against a posting — and `mapAnalysis` is applied
+ * at the point of display instead.
  */
 export async function uploadResume(file, { label } = {}) {
   const body = new FormData()
@@ -509,62 +529,45 @@ export async function uploadResume(file, { label } = {}) {
   if (label) body.append("label", label)
 
   try {
-    const data = await request("/resumes", { method: "POST", body })
-    return { resume: mapResumeMeta(data.resume), analysis: mapAnalysis(data.analysis, data.resume) }
+    const data = await request("/resumes/analyse", { method: "POST", body })
+    return { resume: data.resume ?? null, analysis: data.analysis ?? null }
   } catch (error) {
-    const saved = error?.data?.resume
-    if (saved) {
-      return { resume: mapResumeMeta(saved), analysis: null, canRetry: true, reason: error.message }
+    const parsed = error?.data?.resume
+    if (parsed) {
+      return {
+        resume: parsed,
+        analysis: null,
+        canRetry: true,
+        reason: error.message,
+      }
     }
     throw error
   }
 }
 
-export async function listResumes() {
-  const data = await request("/resumes")
-  return (data.resumes ?? []).map((resume) => ({
-    ...mapResumeMeta(resume),
-    raw: resume,
-  }))
-}
-
-export async function getResume(id) {
-  const data = await request(`/resumes/${id}`)
-  return { resume: mapResumeMeta(data.resume), analysis: mapAnalysis(data.analysis, data.resume) }
-}
-
 /**
- * Every version with its score, so the dashboard can show a score per card
- * without one request each. `GET /analysis` populates the resume behind each
- * row, which is where the filename and label come from.
+ * POST /api/analysis — re-runs the analysis on text this browser already holds.
+ *
+ * This is what "Re-run analysis" does: it sends the stored text back rather than
+ * asking the user to find and re-upload the file they gave us minutes ago. The
+ * result is in the server's own shape, ready to be stored as-is.
  */
-export async function listAnalyses() {
-  const data = await request("/analysis")
-
-  return (data.analyses ?? []).map((row) => ({
-    id: row.id,
-    resumeId: row.resume?.id ?? row.resume?._id ?? row.resume,
-    label: row.resume?.label ?? "Main",
-    originalName: row.resume?.originalName ?? "",
-    score: row.score ?? 0,
-    verdict: row.verdict ?? "",
-    createdAt: row.resume?.createdAt ?? row.createdAt,
-  }))
+export async function reanalyse(text) {
+  const data = await request("/analysis", { method: "POST", body: { text } })
+  return data.analysis ?? null
 }
 
-export async function getAnalysis(resumeId) {
-  const data = await request(`/analysis/${resumeId}`)
-  return mapAnalysis(data.analysis, data.resume)
-}
+/** POST /api/analysis/improve — "Improve My CV", from a stored analysis. */
+export async function improveCv(analysis) {
+  const data = await request("/analysis/improve", {
+    method: "POST",
+    body: {
+      profile: analysis?.profile ?? {},
+      weaknesses: analysis?.weaknesses ?? [],
+      recommendations: analysis?.recommendations ?? [],
+    },
+  })
 
-export async function reanalyse(resumeId) {
-  const data = await request(`/analysis/${resumeId}`, { method: "POST" })
-  return { resume: mapResumeMeta(data.resume), analysis: mapAnalysis(data.analysis, data.resume) }
-}
-
-/** POST /api/analysis/:resumeId/improve — "Improve My CV". */
-export async function improveCv(resumeId) {
-  const data = await request(`/analysis/${resumeId}/improve`, { method: "POST" })
   return {
     improvedSummary: data.improvements?.improvedSummary ?? "",
     suggestions: data.improvements?.suggestions ?? [],
@@ -573,11 +576,27 @@ export async function improveCv(resumeId) {
   }
 }
 
-/** Two to five versions side by side, with the leader marked on every row. */
-export async function compareVersions(resumeIds) {
+/**
+ * POST /api/analysis/compare — two to five versions side by side.
+ *
+ * The versions travel in the body because the browser is what holds them. The
+ * arithmetic stays on the server, next to the scoring it reads, so there is one
+ * implementation of "which version wins" rather than two.
+ *
+ * @param {Array<{id: string, label: string, originalName: string, createdAt: string, analysis: object}>} versions
+ */
+export async function compareVersions(versions) {
   const data = await request("/analysis/compare", {
     method: "POST",
-    body: { resumeIds },
+    body: {
+      versions: versions.map((version) => ({
+        resumeId: version.id,
+        label: version.label,
+        originalName: version.originalName,
+        createdAt: version.createdAt,
+        analysis: version.analysis,
+      })),
+    },
   })
 
   return {
@@ -587,107 +606,33 @@ export async function compareVersions(resumeIds) {
   }
 }
 
-export async function renameResume(id, label) {
-  const data = await request(`/resumes/${id}`, { method: "PATCH", body: { label } })
-  return mapResumeMeta(data.resume)
-}
-
-export async function deleteResume(id) {
-  const data = await request(`/resumes/${id}`, { method: "DELETE" })
-  return data.message ?? "Resume deleted."
-}
-
-/** The extracted text, for the "what the parser actually read" view. */
-export async function getExtractedText(id) {
-  return request(`/resumes/${id}/text`)
-}
-
 /**
- * Downloads the original file. The file is behind an authenticated route, so a
- * plain `<a href>` would 401; this fetches it with the bearer token and hands
- * the browser a blob URL instead.
+ * What the server accepts.
+ *
+ * The uploader validates against its own copy of these rules so a wrong format is
+ * caught before a round-trip, and the endpoint exists so the two cannot drift
+ * apart unnoticed.
  */
-export async function downloadResume(id, filename) {
-  const response = await fetch(`${API_BASE}/resumes/${id}/file`, {
-    headers: { Authorization: `Bearer ${getToken()}` },
-  })
-
-  handleUnauthorized(response)
-
-  if (!response.ok) {
-    const payload = await response.json().catch(() => null)
-    throw new ApiError(payload?.message ?? "That file could not be downloaded.", response.status)
-  }
-
-  const blob = await response.blob()
-  const url = URL.createObjectURL(blob)
-  const anchor = document.createElement("a")
-  anchor.href = url
-  anchor.download = filename || "resume"
-  document.body.append(anchor)
-  anchor.click()
-  anchor.remove()
-  URL.revokeObjectURL(url)
-}
-
 export async function getUploadLimits() {
-  return request("/resumes/limits", { auth: false })
+  return request("/resumes/limits")
 }
 
 /* ------------------------------------------------------------------ *
  * Job matching
  * ------------------------------------------------------------------ */
 
-export async function createMatch({ resumeId, jobDescription, jobTitle, company }) {
+/**
+ * POST /api/jobs/match
+ *
+ * The candidate side of the comparison is an analysis this browser kept from an
+ * earlier call, so it travels in the body. The match comes back and is kept here.
+ */
+export async function createMatch({ analysis, resumeId, jobDescription, jobTitle, company }) {
   const data = await request("/jobs/match", {
     method: "POST",
-    body: { resumeId, jobDescription, jobTitle, company },
+    body: { analysis, resumeId, jobDescription, jobTitle, company },
   })
   return data.match
-}
-
-/**
- * The stored match history. `GET /jobs` returns summary rows rather than the
- * full document, so this is a light shape: enough to render the list, and the
- * full match is fetched on demand when one is opened.
- */
-export async function listMatches({ sort, min, max, search, resumeId } = {}) {
-  const query = new URLSearchParams()
-  if (sort) query.set("sort", sort)
-  if (min !== undefined && min !== "") query.set("min", min)
-  if (max !== undefined && max !== "") query.set("max", max)
-  if (search) query.set("search", search)
-  if (resumeId) query.set("resumeId", resumeId)
-
-  const suffix = query.toString() ? `?${query}` : ""
-  const data = await request(`/jobs${suffix}`)
-
-  return (data.matches ?? []).map((job) => ({
-    id: job.id,
-    jobTitle: job.jobTitle || "Untitled role",
-    company: job.company || "",
-    score: job.score ?? 0,
-    verdict: job.verdict || "",
-    resumeId: job.resume ?? null,
-    createdAt: job.createdAt,
-    matchingSkills: job.matchingSkills ?? [],
-    missingSkills: job.missingSkills ?? [],
-  }))
-}
-
-export async function getMatch(id) {
-  const data = await request(`/jobs/${id}`)
-  return data.match
-}
-
-export async function deleteMatch(id) {
-  const data = await request(`/jobs/${id}`, { method: "DELETE" })
-  return data.message ?? "Job match deleted."
-}
-
-export async function clearMatches() {
-  const data = await request("/jobs", { method: "DELETE" })
-  return data.message ?? "History cleared."
 }
 
 /* ------------------------------------------------------------------ *

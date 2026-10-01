@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react"
 
 import * as api from "@/services/api"
+import { clear } from "@/services/workspace"
 
 /**
  * Session state backed by the real API.
@@ -10,6 +11,10 @@ import * as api from "@/services/api"
  * valid. `isInitialising` covers that round-trip, and protected routes stay
  * closed until it finishes rather than flashing the dashboard and bouncing the
  * user back out.
+ *
+ * What the session unlocks is deliberately thin. The database knows a name, an
+ * email and a password hash; the CVs, analyses and job matches live in this
+ * browser under the account id, and only this provider knows where.
  */
 
 const AuthContext = createContext(null)
@@ -66,35 +71,52 @@ export function AuthProvider({ children }) {
     return () => window.removeEventListener("intelme:signed-out", handleSignedOut)
   }, [])
 
-  // Signing out invalidates every cached resume, analysis and match, otherwise
-  // the next person to sign in on this browser would see the previous one.
+  // Signing out empties the screen but leaves the account's documents in this
+  // browser. They are the user's, keyed to their account id, and signing back in
+  // brings them straight back — while nobody else at the machine sees anything,
+  // because the provider state below is gone.
   const handleLogout = useCallback(() => {
     api.logout()
     setUser(null)
     window.dispatchEvent(new CustomEvent("intelme:data-cleared"))
   }, [])
 
-  const login = useCallback(async (credentials) => {
-    setIsLoading(true)
-    try {
-      const session = await api.login(credentials)
-      setUser(session)
-      return session
-    } finally {
-      setIsLoading(false)
-    }
+  // Signing in must not inherit the last person's data. The documents are keyed to
+  // the account id, so a different account reads a different key — but the
+  // in-memory copy has to be dropped before the new session is adopted, or the
+  // dashboard would briefly render the previous one's CVs while the load effect
+  // catches up. Dispatching first and setting the user second is what makes the
+  // order right: the event is handled synchronously, the load happens on the
+  // next render.
+  const adoptSession = useCallback((session) => {
+    window.dispatchEvent(new CustomEvent("intelme:data-cleared"))
+    setUser(session)
+    return session
   }, [])
 
-  const register = useCallback(async (details) => {
-    setIsLoading(true)
-    try {
-      const session = await api.register(details)
-      setUser(session)
-      return session
-    } finally {
-      setIsLoading(false)
-    }
-  }, [])
+  const login = useCallback(
+    async (credentials) => {
+      setIsLoading(true)
+      try {
+        return adoptSession(await api.login(credentials))
+      } finally {
+        setIsLoading(false)
+      }
+    },
+    [adoptSession],
+  )
+
+  const register = useCallback(
+    async (details) => {
+      setIsLoading(true)
+      try {
+        return adoptSession(await api.register(details))
+      } finally {
+        setIsLoading(false)
+      }
+    },
+    [adoptSession],
+  )
 
   /**
    * Writes a name or email change to the account and adopts the session the
@@ -124,21 +146,25 @@ export function AuthProvider({ children }) {
   }, [])
 
   /**
-   * Deletes the account, then signs out locally. The account document held the
-   * resumes, analyses and job matches, so the server removed all of them in the
-   * same delete — what is left to do here is drop the token that now points at
-   * nothing and clear the copies the browser is still holding.
+   * Deletes the account, then signs out locally.
+   *
+   * The server removes one document holding three fields, and there is no cascade
+   * because nothing about a CV was ever stored there. The copy this browser holds
+   * *is* the CV, so it is destroyed here alongside the account — keeping data
+   * keyed to an account id that no longer resolves would be the one way to leave
+   * a CV behind on a machine the user believes they have cleaned.
    */
   const deleteAccount = useCallback(async () => {
     setIsDeleting(true)
     try {
       await api.deleteAccount()
+      if (user?.id) clear(user.id)
       setUser(null)
       window.dispatchEvent(new CustomEvent("intelme:data-cleared"))
     } finally {
       setIsDeleting(false)
     }
-  }, [])
+  }, [user?.id])
 
   const value = useMemo(
     () => ({

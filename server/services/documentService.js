@@ -1,99 +1,82 @@
-import { EXTRACTION_METHOD, RESUME_STATUS } from "../models/Resume.js";
-import { analyseResume, isAIConfigured, AIServiceError } from "./aiService.js";
-import { extractResumeText, ExtractionError } from "./ocrService.js";
-import { scoreResume, scoreVerdict } from "./scoringService.js";
+import { randomUUID } from "node:crypto";
+
 import { getExtension } from "../middleware/uploadMiddleware.js";
-import { pushAnalysis, pushResume } from "./accountService.js";
 import { ValidationError } from "../utils/validators.js";
+import { analyseResume, isAIConfigured, AIServiceError } from "./aiService.js";
+import { scoreResume, scoreVerdict } from "./scoringService.js";
 
 /**
  * The resume pipeline.
  *
- *   upload -> store file -> extract text (embedded layer, then OCR) -> persist
- *          -> send to Groq for structured JSON -> score it -> persist analysis
+ *   read file -> recover text (embedded layer, then OCR) -> send it to Groq for
+ *              structured JSON -> score it -> hand both back
  *
- * Every step writes its own status onto the resume, so a failure halfway through
- * is visible on the dashboard instead of looking like a hang.
+ * Nothing here writes. That is the whole design: the account document holds a
+ * name, an email and a password hash, and every CV the user has ever uploaded
+ * lives in their browser instead. The server's only job is the part a browser
+ * cannot do — read a PDF, OCR a scan, and call the model — and it does that work
+ * on a temporary file it deletes before it answers.
  *
- * Both steps take the signed-in account document and save their result into it,
- * so a CV, its analysis and the job matches derived from them all live in the
- * same `users` document. Mongoose persists only the element that changed, so
- * these saves stay proportional to what actually moved rather than to the size
- * of the account.
+ * So there is no "resume" model and no "analysis" model. There is a pipeline and
+ * a pair of plain, JSON-safe objects.
  */
+
+/** The score-derived fixes lead, because they reflect the number being judged on. */
+const mergeUnique = (...lists) => {
+  const seen = new Set();
+  const merged = [];
+
+  for (const list of lists) {
+    for (const entry of list ?? []) {
+      if (!entry || seen.has(entry)) continue;
+      seen.add(entry);
+      merged.push(entry);
+    }
+  }
+
+  return merged;
+};
 
 /**
- * Step 1-2: persist the uploaded file and recover its text.
+ * The plain description of a file that has just been parsed.
+ *
+ * There is deliberately no id and no path. The browser names the version — it is
+ * the thing that has to be able to refer to it across reloads — and the path is
+ * unlinked by the caller the moment this function returns.
  *
  * @param {object} params
- * @param {import("mongoose").Document} params.user the account to nest the resume in
- * @returns {Promise<import("mongoose").Document>} the stored Resume subdocument
+ * @param {import("express").Request["file"]} params.file  the multer upload
+ * @param {string} params.label  the user-facing version label
+ * @param {string} params.text  the recovered plain text
+ * @param {string} params.method  how the text was recovered
+ * @param {number} params.chars  length of the recovered text
  */
-export async function ingestResume({ user, file, label = "Main" }) {
-  if (!file) {
-    throw new ValidationError("No file was uploaded.");
-  }
-
-  const fileType = getExtension(file.originalname);
-
-  // The download URL needs the resume id, and Mongoose assigns that when the
-  // subdocument is pushed, so both go in with a single write. The placeholder
-  // below never leaves the server.
-  const resume = await pushResume(user, {
+export function buildResumeRecord({ file, label = "Main", text = "", method = "", chars = 0 }) {
+  return {
     originalName: file.originalname,
-    fileType,
-    // Download goes through an authenticated route, never a public static path.
-    fileUrl: "/api/resumes/pending/file",
-    filePath: file.path,
+    fileType: getExtension(file.originalname),
     fileSize: file.size ?? 0,
     label,
-    status: RESUME_STATUS.PROCESSING,
+    extractionMethod: method,
+    characters: chars,
+    extractedText: text,
     createdAt: new Date(),
-  });
-
-  resume.fileUrl = `/api/resumes/${resume._id}/file`;
-  await user.save();
-
-  try {
-    const { text, method, chars } = await extractResumeText({
-      filePath: file.path,
-      fileType,
-    });
-
-    resume.extractedText = text;
-    resume.extractionMethod = method;
-    resume.status = RESUME_STATUS.COMPLETED;
-    resume.error = null;
-    await user.save();
-
-    console.info(
-      `[doc] ${resume.originalName}: ${chars} chars via ${method} (${method === EXTRACTION_METHOD.OCR ? "OCR" : "text layer"})`,
-    );
-
-    return resume;
-  } catch (error) {
-    resume.status = RESUME_STATUS.FAILED;
-    resume.error = error.message?.slice(0, 300) ?? "Text extraction failed.";
-    await user.save();
-
-    // A file we cannot read is useless to the user; stop here rather than
-    // handing an empty document to the model.
-    if (error instanceof ExtractionError) throw error;
-
-    throw new ExtractionError("The file could not be read. Try exporting a fresh PDF or DOCX.");
-  }
+  };
 }
 
 /**
- * Step 3-4: send the extracted text to Groq, score the result, persist it.
+ * Sends recovered text to Groq and scores the result.
+ *
+ * The score is computed here from the structured data, not taken from the model,
+ * so the number the candidate sees is always reproducible from the breakdown that
+ * sits next to it.
  *
  * @param {object} params
- * @param {import("mongoose").Document} params.resume the stored Resume subdocument
- * @param {import("mongoose").Document} params.user  the account to nest the analysis in
- * @returns {Promise<import("mongoose").Document>} the created Analysis subdocument
+ * @param {string} params.text  the plain text recovered from the file
+ * @returns {Promise<object>} a JSON-safe analysis, minted fresh on every call
  */
-export async function analyseStoredResume({ resume, user }) {
-  if (!resume?.extractedText?.trim()) {
+export async function buildAnalysis({ text }) {
+  if (!text?.trim()) {
     throw new ValidationError("This resume has no readable text to analyse.");
   }
 
@@ -107,46 +90,32 @@ export async function analyseStoredResume({ resume, user }) {
   let structured;
 
   try {
-    structured = await analyseResume(resume.extractedText);
+    structured = await analyseResume(text);
   } catch (error) {
     if (error instanceof AIServiceError) throw error;
     throw new AIServiceError("The AI analysis could not be completed.", { cause: error });
   }
 
-  // The score is computed from the structured data, not taken from the model,
-  // so it can be recomputed and audited at any time.
   const { score, breakdown, strengths, weaknesses, recommendations } = scoreResume({
     analysis: structured,
-    rawText: resume.extractedText,
+    rawText: text,
   });
 
-  const analysis = await pushAnalysis(user, {
-    resume: resume._id,
+  return {
+    id: randomUUID(),
+    createdAt: new Date(),
     score,
+    verdict: scoreVerdict(score),
     scoreBreakdown: breakdown,
     ...structured,
-    // The AI's qualitative read is kept alongside the deterministic one; the
-    // dashboard shows the union so a good suggestion is never thrown away.
-    // The score-derived fixes lead, because they always reflect the number the
-    // candidate is actually being judged on.
-    strengths: [...new Set([...strengths, ...(structured.strengths ?? [])])].slice(0, 10),
-    weaknesses: [...new Set([...weaknesses, ...(structured.weaknesses ?? [])])].slice(0, 10),
-    recommendations: [...new Set([...(recommendations ?? []), ...(structured.recommendations ?? [])])].slice(
-      0,
-      12,
-    ),
-    createdAt: new Date(),
-  });
-
-  return analysis;
-}
-
-/** Full pipeline for a single upload. */
-export async function processResumeUpload({ user, file, label }) {
-  const resume = await ingestResume({ user, file, label });
-  const analysis = await analyseStoredResume({ resume, user });
-
-  return { resume, analysis };
+    // The AI's qualitative read is kept alongside the deterministic one, so a
+    // good suggestion the model found is never thrown away in favour of ours.
+    strengths: mergeUnique(strengths, structured.strengths).slice(0, 10),
+    weaknesses: mergeUnique(weaknesses, structured.weaknesses).slice(0, 10),
+    recommendations: mergeUnique(recommendations, structured.recommendations).slice(0, 12),
+    // Filled in by the "Improve my CV" endpoint and written back by the browser.
+    improvements: null,
+  };
 }
 
 /**
@@ -155,6 +124,9 @@ export async function processResumeUpload({ user, file, label }) {
  * The rows are the match categories plus the CV categories that mean something
  * across versions (structure and keywords especially), so the table answers
  * "which version reads better?" rather than only "which scores higher?".
+ *
+ * Values are read by position rather than by id: the browser holds these
+ * analyses and there is nothing guaranteeing they were minted with one.
  */
 export function compareAnalyses(analyses) {
   const metrics = [
@@ -168,35 +140,31 @@ export function compareAnalyses(analyses) {
     { key: "keywords", label: "Keywords" },
   ];
 
-  const breakdownOf = new Map(
-    analyses.map((analysis) => [String(analysis.id ?? analysis._id), new Map(
-      (analysis.scoreBreakdown ?? []).map((row) => [row.key, row.score]),
-    )]),
+  const breakdowns = analyses.map(
+    (analysis) => new Map((analysis?.scoreBreakdown ?? []).map((row) => [row.key, row.score])),
   );
 
   const rows = metrics.map((metric) => ({
     metric: metric.key,
     label: metric.label,
-    values: analyses.map((analysis) => {
-      const id = String(analysis.id ?? analysis._id);
-
+    values: analyses.map((analysis, index) => {
       if (metric.key === "keywords") {
         // Not a scored CV category: measure keyword volume directly.
-        return Math.min(100, ((analysis.keywords?.length ?? 0) / 20) * 100);
+        return Math.min(100, ((analysis?.keywords?.length ?? 0) / 20) * 100);
       }
 
-      return breakdownOf.get(id)?.get(metric.key) ?? 0;
+      return breakdowns[index].get(metric.key) ?? 0;
     }),
   }));
 
   rows.push({
     metric: "overall",
     label: "Overall",
-    values: analyses.map((analysis) => analysis.score),
+    values: analyses.map((analysis) => analysis?.score ?? 0),
   });
 
   return rows;
 }
 
 export { scoreVerdict };
-export default processResumeUpload;
+export default buildAnalysis;

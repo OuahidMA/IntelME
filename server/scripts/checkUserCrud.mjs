@@ -1,24 +1,40 @@
 /**
  * Proves that an account created through the API is really a document in the
- * `users` collection of the `intelme` database, that everything belonging to it
- * lives inside that one document, and that every CRUD operation lands there.
+ * `users` collection of the `intelme` database, that it holds nothing but a name,
+ * an email and a password hash, and that every CRUD operation lands there.
+ *
+ * The central assertion is the last one: after uploading a CV, analysing it,
+ * matching a job against it and deleting the account, the document is unchanged.
+ * That is the whole point of the current design, and nothing about a
+ * conventional CRUD test would catch a regression in it — a resume subdocument
+ * would look like a perfectly working endpoint.
  *
  * This reads the raw driver rather than the Mongoose model on purpose: the
  * question is what MongoDB actually holds, not what the app believes it holds.
- * Each step prints the stored document so the effect of the write is visible.
  */
 
 import "dotenv/config";
-import fs from "node:fs";
+import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import mongoose from "mongoose";
 
 import User from "../models/User.js";
-import { UPLOAD_DIR } from "../middleware/uploadMiddleware.js";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const FIXTURES = path.resolve(__dirname, "..", "uploads", "__fixtures__");
+const UPLOADS = path.resolve(__dirname, "..", "uploads");
 const BASE = "http://localhost:5000/api";
 const password = "CrudCheck123!";
+
+/**
+ * Exactly the fields an account document is allowed to carry.
+ *
+ * Sorted, because it is compared against `Object.keys(doc).sort()` — otherwise a
+ * test that only ever fails on its own bookkeeping is worse than no test.
+ */
+const ALLOWED_FIELDS = ["_id", "createdAt", "email", "name", "password"];
 
 let failures = 0;
 const check = (label, condition, detail) => {
@@ -43,8 +59,37 @@ async function api(route, { method = "GET", body, token } = {}) {
   return { status: response.status, data: await response.json().catch(() => ({})) };
 }
 
+async function upload(fileName, mime, token) {
+  const bytes = await fs.readFile(path.join(FIXTURES, fileName));
+  const form = new FormData();
+  form.append("file", new Blob([bytes], { type: mime }), fileName);
+  form.append("label", "Crud check");
+
+  const response = await fetch(`${BASE}/resumes/analyse`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+
+  return { status: response.status, data: await response.json().catch(() => ({})) };
+}
+
 /** The raw document, straight from the driver, bypassing every schema layer. */
 const raw = (db) => (email) => db.collection("users").findOne({ email });
+
+/** Everything the driver holds for one account, minus the immutable _id. */
+const snapshot = async (email) => {
+  const doc = await raw(db)(email);
+  if (!doc) return null;
+  const { _id, ...rest } = doc;
+  return rest;
+};
+
+/** Uploaded files sitting on disk, excluding the fixtures the tests read. */
+async function countUploads() {
+  const entries = await fs.readdir(UPLOADS, { withFileTypes: true });
+  return entries.filter((entry) => entry.isFile()).length;
+}
 
 /** What MongoDB actually holds in this database — should only ever be `users`. */
 const collectionNames = async () => (await db.listCollections({}, { nameOnly: true }).toArray()).map((c) => c.name).sort();
@@ -83,6 +128,17 @@ check("the password is a bcrypt hash, not plaintext", /^\$2[aby]\$\d{2}\$/.test(
 check("the plaintext password is not stored anywhere", !JSON.stringify(doc).includes(password));
 check("the API response omits the password", !("password" in (created.data.user ?? {})));
 
+console.log("\nSHAPE — the document holds account details and nothing else");
+const fields = Object.keys(doc ?? {}).sort();
+check(
+  "it holds exactly the four account fields plus _id",
+  fields.join(",") === ALLOWED_FIELDS.join(","),
+  fields.join(", "),
+);
+for (const field of ["resumes", "analyses", "jobs"]) {
+  check(`it has no \`${field}\` array`, !(field in (doc ?? {})), field);
+}
+
 console.log("\nREAD — GET /api/auth/me and POST /api/auth/login");
 const me = await api("/auth/me", { token: created.data.token });
 check("the account reads back by token", me.status === 200 && me.data.user?.email === email.toLowerCase());
@@ -105,8 +161,8 @@ doc = await find(newEmail.toLowerCase());
 check("the stored name changed", doc?.name === "Renamed Person", doc?.name);
 check("the stored email changed and was lowercased", doc?.email === newEmail.toLowerCase(), doc?.email);
 check("the old email no longer resolves", (await find(email)) === null);
-check("_id is unchanged by the update", String(doc?._id) === String(created.data.user?.id ?? doc?._id));
 check("createdAt was not modified by the update", doc?.createdAt instanceof Date);
+check("the update added no fields", Object.keys(doc ?? {}).sort().join(",") === ALLOWED_FIELDS.join(","), Object.keys(doc ?? {}).sort().join(", "));
 
 console.log("\nUPDATE — PATCH /api/auth/me/password");
 const beforeHash = doc?.password;
@@ -123,66 +179,84 @@ check("the new password still hashes (it is not plaintext)", /^\$2[aby]\$\d{2}\$
 check("the old password no longer logs in", (await api("/auth/login", { method: "POST", body: { email: newEmail, password } })).status === 401);
 check("the new password does log in", (await api("/auth/login", { method: "POST", body: { email: newEmail, password: "BrandNewPass456!" } })).status === 200);
 
+/* ------------------------------------------------------------------ *
+ * The CV journey leaves the database untouched
+ * ------------------------------------------------------------------ */
+
+console.log("\nCV JOURNEY — nothing reaches the database");
+{
+  const filesBefore = await countUploads();
+  const before = await snapshot(newEmail.toLowerCase());
+
+  console.log("  uploading (this calls the live AI, so it takes a moment)…");
+  const uploaded = await upload("john-doe-cv.pdf", "application/pdf", created.data.token);
+
+  check("the upload is analysed", uploaded.status === 201, `status ${uploaded.status} ${uploaded.data?.message ?? ""}`);
+  check("it returns the text it recovered", (uploaded.data?.resume?.extractedText?.length ?? 0) > 200, `${uploaded.data?.resume?.characters} chars`);
+  check("it returns an analysis", typeof uploaded.data?.analysis?.score === "number", `score ${uploaded.data?.analysis?.score}`);
+  check("the analysis carries no resume id", uploaded.data?.analysis?.resume === undefined && uploaded.data?.analysis?.resumeId === undefined);
+  check("the resume record carries no id (the browser names it)", uploaded.data?.resume?.id === undefined);
+  check("the resume record carries no server path", !JSON.stringify(uploaded.data?.resume ?? {}).includes("uploads"));
+
+  const text = uploaded.data?.resume?.extractedText ?? "";
+
+  if (text.length > 40) {
+    const refreshed = await api("/analysis", {
+      method: "POST",
+      token: created.data.token,
+      body: { text },
+    });
+    check("POST /analysis re-analyses stored text", refreshed.status === 200 && typeof refreshed.data?.analysis?.score === "number", `status ${refreshed.status}`);
+
+    const tooShort = await api("/analysis", {
+      method: "POST",
+      token: created.data.token,
+      body: { text: "nothing here" },
+    });
+    check("POST /analysis rejects unusable text", tooShort.status === 400, `status ${tooShort.status}`);
+
+    if (uploaded.data?.analysis) {
+      const matched = await api("/jobs/match", {
+        method: "POST",
+        token: created.data.token,
+        body: {
+          analysis: uploaded.data.analysis,
+          resumeId: "browser-owned-id",
+          jobDescription:
+            "Frontend Developer. You must have strong React, TypeScript and JavaScript skills. You need at least 2 years of experience building component libraries and design systems. Knowledge of REST APIs, Git and Tailwind CSS is required. You will work on accessibility and performance. A bachelor's degree in Computer Science is preferred.",
+        },
+      });
+      check("POST /jobs/match scores a browser-supplied analysis", matched.status === 201, `status ${matched.status} ${matched.data?.message ?? ""}`);
+      check("the match comes back with a score", typeof matched.data?.match?.score === "number", `${matched.data?.match?.score}`);
+      check("the match echoes the browser's own version id", matched.data?.match?.resumeId === "browser-owned-id", matched.data?.match?.resumeId);
+      check("the match breakdown has the 6 weighted categories", matched.data?.match?.scoreBreakdown?.length === 6, `${matched.data?.match?.scoreBreakdown?.length}`);
+    } else {
+      console.log("  (no analysis came back, so the match step was skipped)");
+    }
+  }
+
+  const after = await snapshot(newEmail.toLowerCase());
+
+  check(
+    "the account document is byte-identical after the whole CV journey",
+    JSON.stringify(before) === JSON.stringify(after),
+    `${Object.keys(after ?? {}).sort().join(", ")}`,
+  );
+  check(
+    "the upload was deleted from the server's disk",
+    (await countUploads()) === filesBefore,
+    `${filesBefore} files before, ${await countUploads()} after`,
+  );
+  check("writing them created no extra collection", (await collectionNames()).join(", ") === "users", (await collectionNames()).join(", "));
+}
+
 console.log("\nDELETE — DELETE /api/auth/me");
 const deleted = await api("/auth/me", { method: "DELETE", token: created.data.token });
 check("the account is deleted", deleted.status === 200, `status ${deleted.status}`);
 check("no document remains in intelme.users", (await find(newEmail)) === null);
-const after = await db.collection("users").countDocuments();
-check("the collection is back to its original size", after === baseline, `${baseline} before, ${after} after`);
-
-console.log("\nEMBEDDED STORAGE — one document holds the whole account");
-const email2 = `crud.embedded.${Date.now()}@example.com`;
-const second = await api("/auth/register", { method: "POST", body: { name: "Nested Tester", email: email2, password } });
-check("a second account is created", second.status === 201, `status ${second.status}`);
-
-const embedded = await find(email2);
-check("a new account starts with three empty arrays",
-  Array.isArray(embedded.resumes) && Array.isArray(embedded.analyses) && Array.isArray(embedded.jobs) &&
-    embedded.resumes.length === 0 && embedded.analyses.length === 0 && embedded.jobs.length === 0,
-  `resumes=${embedded.resumes?.length} analyses=${embedded.analyses?.length} jobs=${embedded.jobs?.length}`);
-
-const fileName = `crudcheck-${Date.now()}.txt`;
-const filePath = path.join(UPLOAD_DIR, fileName);
-fs.writeFileSync(filePath, "placeholder for the storage check");
-const resumeId = new mongoose.Types.ObjectId();
-const analysisId = new mongoose.Types.ObjectId();
-const jobId = new mongoose.Types.ObjectId();
-
-await db.collection("users").updateOne(
-  { email: email2 },
-  {
-    $push: {
-      resumes: { _id: resumeId, label: "Nested", originalName: fileName, storedName: fileName, fileType: "txt", fileSize: 30, filePath, fileUrl: `/api/resumes/${resumeId}/file`, extractionMethod: "text", extractedText: "Nested Tester resume text", createdAt: new Date() },
-      analyses: { _id: analysisId, resume: resumeId, score: 77, verdict: "Strong match", createdAt: new Date() },
-      jobs: { _id: jobId, resume: resumeId, analysis: analysisId, jobTitle: "Nested Role", company: "Nested Co", score: 70, createdAt: new Date() },
-    },
-  },
-);
-
-const seeded = await find(email2);
-check("the three entries are stored inside the account document",
-  seeded.resumes.length === 1 && seeded.analyses.length === 1 && seeded.jobs.length === 1,
-  `resumes=${seeded.resumes.length} analyses=${seeded.analyses.length} jobs=${seeded.jobs.length}`);
-check("the entries carry no owner field",
-  seeded.resumes[0].user === undefined && seeded.analyses[0].user === undefined && seeded.jobs[0].user === undefined);
-check("the analysis points at the nested resume", String(seeded.analyses[0].resume) === String(resumeId));
-check("the match points at the nested resume and analysis",
-  String(seeded.jobs[0].resume) === String(resumeId) && String(seeded.jobs[0].analysis) === String(analysisId));
-check("the resume keeps its own file path", seeded.resumes[0].filePath === filePath);
-check("writing them created no extra collection", (await collectionNames()).join(", ") === "users", (await collectionNames()).join(", "));
-
-const listed = await api("/resumes", { token: second.data.token });
-check("the API serves the nested resume", listed.data?.count === 1 && listed.data?.resumes?.[0]?.id === String(resumeId), `count=${listed.data?.count} ${listed.data?.message ?? ""}`);
-check("the API does not leak the file path", (listed.data?.resumes?.[0]?.filePath ?? null) === null, JSON.stringify(listed.data?.resumes?.[0]?.filePath));
-
-const history = await api("/jobs", { token: second.data.token });
-check("the API serves the nested match", history.data?.count === 1 && history.data?.matches?.[0]?.id === String(jobId), `count=${history.data?.count} ${history.data?.message ?? ""}`);
-
-await api("/auth/me", { method: "DELETE", token: second.data.token });
-check("deleting the account takes the nested data with it", (await find(email2)) === null);
-check("and unlinks the file it owned", !fs.existsSync(filePath));
+const afterCount = await db.collection("users").countDocuments();
+check("the collection is back to its original size", afterCount === baseline, `${baseline} before, ${afterCount} after`);
 check("still only the users collection", (await collectionNames()).join(", ") === "users", (await collectionNames()).join(", "));
-check("the collection is still at its original size", (await db.collection("users").countDocuments()) === baseline);
 
 console.log(failures === 0 ? "\nAll user CRUD checks passed." : `\n${failures} user CRUD check(s) failed.`);
 await mongoose.disconnect();

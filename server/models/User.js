@@ -1,25 +1,22 @@
 import mongoose from "mongoose";
 
-import analysisSchema from "./Analysis.js";
-import jobSchema from "./Job.js";
-import resumeSchema from "./Resume.js";
-
 /**
  * The account document, and the only document in the database.
  *
- * `users` is the single collection. A CV, its analyses and every job match are
- * embedded as subdocuments of the account that owns them rather than living in
- * collections of their own, which means:
+ * Three fields: a name, an email and a bcrypt hash of the password. That is the
+ * whole of what this app keeps server-side. A CV, its analysis and every job
+ * match belong to the candidate and are never sent to us to be filed away — the
+ * uploaded file is parsed, the text is handed back to the browser, the file is
+ * deleted from disk, and from that point on the version, its score and the
+ * matches scored against it live in the user's own `localStorage` under
+ * `intelme.data.<userId>` (see `client/src/Services/localStore.js`).
  *
- *   - registering a user cannot create anything but a `users` document;
- *   - ownership is structural — a resume is only ever reachable through the
- *     account document that holds it, so there is no `user` field to forget when
- *     a query is written;
- *   - deleting an account removes everything that belonged to it in one write.
+ * So registering an account writes exactly one document with exactly those three
+ * values, and deleting it is one `deleteOne` with no cascade to run: nothing
+ * about a CV exists here to leave behind.
  *
- * The cost is that an account document must stay under MongoDB's 16 MB document
- * limit, and that reads of the history are served from the account document
- * instead of by an indexed query. Both are fine at the scale this app works at.
+ * The cost of that trade is honest and worth stating — there is no cross-device
+ * sync. Sign in on another browser and the account is there, empty.
  */
 
 /**
@@ -49,29 +46,6 @@ const userSchema = new mongoose.Schema(
       required: [true, "Password is required"],
       select: false,
     },
-    /**
-     * Every CV version this account has uploaded. The array is append-only in
-     * upload order, so "newest first" is applied when it is read rather than by
-     * keeping the stored order itself in flux.
-     */
-    resumes: {
-      type: [resumeSchema],
-      default: () => [],
-    },
-    /**
-     * One entry per analysis run, each pointing at the resume it came from.
-     * Re-running an analysis appends a new one and the old one is pruned, so
-     * there is at most one live analysis per version.
-     */
-    analyses: {
-      type: [analysisSchema],
-      default: () => [],
-    },
-    /** The scored job match history, in the order it was produced. */
-    jobs: {
-      type: [jobSchema],
-      default: () => [],
-    },
     createdAt: {
       type: Date,
       default: Date.now,
@@ -79,14 +53,15 @@ const userSchema = new mongoose.Schema(
     },
   },
   {
+    // `strict` is the default and is stated here because it is now load-bearing
+    // in a way it was not before: this document must be exactly the three fields
+    // a form can supply. A stray `resumes` key on a create call is dropped rather
+    // than written, so no code path can quietly put CV data back in the database.
+    strict: true,
     versionKey: false,
     toJSON: {
       virtuals: true,
       transform(_doc, ret) {
-        // Only the account fields are serialised. The embedded arrays hold PII
-        // (extracted CV text, absolute paths on disk) and are served by the
-        // resume, analysis and job endpoints instead of riding along on every
-        // /auth/me and /auth/login response.
         return {
           id: ret._id.toString(),
           name: ret.name,

@@ -340,25 +340,111 @@ function PasswordForm() {
   )
 }
 
+function formatBytes(bytes) {
+  if (!bytes) return "0 KB"
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+/**
+ * Local data.
+ *
+ * The server holds a name, an email and a password hash — that is all. Every
+ * version, analysis and job match is in this browser, under this account's id,
+ * and there is no copy anywhere else to revoke it from. So this is the only
+ * control that can erase a CV: it is deliberately separate from deleting the
+ * account, because wanting the CV gone is not the same as wanting the login gone.
+ */
+function LocalDataCard() {
+  const { user, isAuthenticated } = useAuth()
+  const { versions, history, localStorageUsed, clearLocalData } = useResume()
+
+  const [isClearing, setIsClearing] = useState(false)
+
+  if (!isAuthenticated) return null
+
+  const hasData = versions.length > 0 || history.length > 0
+
+  async function handleClear() {
+    setIsClearing(true)
+    try {
+      clearLocalData()
+    } finally {
+      setIsClearing(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Data in this browser</CardTitle>
+        <CardDescription>
+          Nothing about your CV is on our servers — this browser holds it, and this is
+          the only place it can be erased from.
+        </CardDescription>
+      </CardHeader>
+
+      <CardContent className="grid gap-4">
+        <ul className="grid gap-1.5 text-sm text-muted-foreground">
+          <li>
+            {versions.length === 0
+              ? "no resume versions"
+              : `${versions.length} resume ${versions.length === 1 ? "version" : "versions"}, with the analysis for each`}
+          </li>
+          <li>
+            {history.length === 0
+              ? "no saved job matches"
+              : `${history.length} saved job ${history.length === 1 ? "match" : "matches"}`}
+          </li>
+          <li>about {formatBytes(localStorageUsed)} of browser storage used</li>
+        </ul>
+
+        <Button
+          variant="outline"
+          onClick={handleClear}
+          disabled={!hasData || isClearing}
+          className="w-fit"
+        >
+          {isClearing ? (
+            <>
+              <LoaderCircle className="size-4 animate-spin" />
+              Clearing…
+            </>
+          ) : (
+            <>
+              <Trash2 data-icon="inline-start" />
+              Clear my resume data
+            </>
+          )}
+        </Button>
+
+        <p className="text-xs text-muted-foreground">
+          This does not sign you out. Clearing the browser data for{" "}
+          {user?.email} only — your account and password are untouched.
+        </p>
+      </CardContent>
+    </Card>
+  )
+}
+
 /**
  * Account deletion.
  *
- * Every resume, analysis and job match is a subdocument of the account, so the
- * server removes all of it — and the uploaded files — in one delete. There is
- * nothing left behind to clean up separately, and nothing that survives the
- * account. Confirming by email is the one step this page cannot skip on its own:
- * the request is irreversible, and a stray click should not be enough.
+ * This removes the account: a name, an email and a password hash. There is no
+ * cascade on the server, because no CV was ever stored there, and the copy this
+ * browser holds is destroyed alongside it — leaving CV data behind under an
+ * account id that no longer resolves is the one outcome that would contradict
+ * what the user was just told. Confirming by email is the one step this page
+ * cannot skip on its own: the request is irreversible, and a stray click should
+ * not be enough.
  */
 function DangerZone() {
   const { user, deleteAccount, isDeleting } = useAuth()
-  const { versions, history } = useResume()
 
   const [isOpen, setIsOpen] = useState(false)
   const [confirmation, setConfirmation] = useState("")
   const [deleteError, setDeleteError] = useState(null)
 
-  const resumeCount = versions.length
-  const matchCount = history.length
   const canDelete = confirmation.trim().toLowerCase() === user.email.toLowerCase()
 
   function openDialog() {
@@ -390,24 +476,15 @@ function DangerZone() {
           Delete account
         </CardTitle>
         <CardDescription>
-          This removes your account and everything listed below. It cannot be
-          undone.
+          This removes your account, and the resume data this browser holds for it.
+          It cannot be undone.
         </CardDescription>
       </CardHeader>
 
       <CardContent className="grid gap-4">
         <ul className="grid gap-1.5 text-sm text-muted-foreground">
-          <li>
-            {resumeCount === 0
-              ? "no resume versions"
-              : `${resumeCount} resume ${resumeCount === 1 ? "version" : "versions"}, with the analysis for each`}
-          </li>
-          <li>
-            {matchCount === 0
-              ? "no saved job matches"
-              : `${matchCount} saved job ${matchCount === 1 ? "match" : "matches"}`}
-          </li>
-          <li>every uploaded file, deleted from the server</li>
+          <li>your name, email and password — the only things we store</li>
+          <li>every resume version, analysis and job match saved in this browser</li>
         </ul>
 
         <Button
@@ -424,10 +501,9 @@ function DangerZone() {
             <AlertDialogHeader>
               <AlertDialogTitle>Delete your account?</AlertDialogTitle>
               <AlertDialogDescription>
-                Your account, {resumeCount === 0 ? "every resume" : `${resumeCount} resume ${resumeCount === 1 ? "version" : "versions"}`}
-                {matchCount > 0 ? `, ${matchCount} saved job ${matchCount === 1 ? "match" : "matches"}` : ""}{" "}
-                and the files behind them are removed from the database. There is no
-                way to get any of it back.
+                Your account is removed from the database, and the resume versions,
+                analyses and job matches this browser is holding for it are erased with
+                it. There is no way to get any of it back.
               </AlertDialogDescription>
             </AlertDialogHeader>
 
@@ -485,13 +561,14 @@ export default function Settings() {
       <div className="grid gap-1">
         <h2 className="text-2xl font-semibold tracking-[-0.9px]">Account settings</h2>
         <p className="text-muted-foreground">
-          The details you sign in with, your password, and — if you want it gone —
-          the account itself.
+          The details you sign in with, your password, the data this browser is holding
+          for you, and — if you want it gone — the account itself.
         </p>
       </div>
 
       <AccountForm />
       <PasswordForm />
+      <LocalDataCard />
       <DangerZone />
     </div>
   )

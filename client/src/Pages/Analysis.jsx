@@ -40,7 +40,8 @@ function EmptyState() {
               <p className="text-lg">No resume on file</p>
               <p className="max-w-sm text-sm text-muted-foreground">
                 PDF or DOCX, up to 5 MB. Scanned PDFs are read with OCR. The file is
-                stored on your account so you can come back to it.
+                parsed on the server, then deleted — only the text and the score stay,
+                in this browser.
               </p>
             </div>
             <Button render={<Link to="/dashboard" />} className="inset-button">

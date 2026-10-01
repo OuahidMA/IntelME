@@ -1,31 +1,46 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react"
 
 import * as api from "@/services/api"
+import * as workspaceStore from "@/services/workspace"
 import { useAuth } from "./AuthContext"
 
 /**
  * Owns everything the three dashboard routes read: the user's CV versions, the
  * analysis of the selected one, the job description being worked on, the match
- * being scored, and the stored match history.
+ * being scored, and the match history.
  *
- * All of it lives in MongoDB, so this provider is a cache over the API rather
- * than the source of truth. Anything that changes on the server is refetched
- * here before the components that depend on it re-render.
+ * All of it lives in this browser. `useWorkspace` reads it straight out of
+ * `localStorage`, and the API is called only for the work a browser genuinely
+ * cannot do — parsing a file, asking the model, scoring the answer. There is no
+ * fetch-on-mount for any list here, because there is no server to fetch them from.
+ *
+ * The consequence worth remembering while editing: the server never tells us
+ * anything about a CV that we did not just send it. So every write follows the
+ * same shape — call the API, take the result, merge it into the workspace, and
+ * let the store re-render. Nothing is written optimistically, because a stored
+ * CV the server cannot be asked about again is the one thing we must never claim
+ * to have saved when we have not.
  */
 
 const ResumeContext = createContext(null)
 
+/** Below this many characters the server will not accept the text back. */
+const MIN_TEXT_LENGTH = 40
+
 export function ResumeProvider({ children }) {
-  const { isAuthenticated } = useAuth()
+  const { user } = useAuth()
+  const userId = user?.id ?? null
 
-  const [versions, setVersions] = useState([])
+  // The documents, read from storage. Signing in, signing out and switching
+  // accounts all swap this with the session — there is nothing to load.
+  const workspace = workspaceStore.useWorkspace(userId)
+  const localStorageUsed = workspaceStore.useStorageFootprint(userId)
+
   const [activeId, setActiveId] = useState(null)
-  const [resume, setResume] = useState(null)
-  const [analysis, setAnalysis] = useState(null)
-
-  const [isLoadingVersions, setIsLoadingVersions] = useState(false)
   const [isAnalysing, setIsAnalysing] = useState(false)
+  const [analysingFileName, setAnalysingFileName] = useState(null)
   const [analysisError, setAnalysisError] = useState(null)
+  const [storageError, setStorageError] = useState(null)
 
   const [isImproving, setIsImproving] = useState(false)
   const [improveError, setImproveError] = useState(null)
@@ -38,108 +53,89 @@ export function ResumeProvider({ children }) {
   const [isMatching, setIsMatching] = useState(false)
   const [matchError, setMatchError] = useState(null)
 
-  const [history, setHistory] = useState([])
   const [historyFilter, setHistoryFilter] = useState({ sort: "date:desc", search: "" })
 
   /* ---------------------------------------------------------------- *
-   * Loading
+   * Persistence
    * ---------------------------------------------------------------- */
 
-  const loadHistory = useCallback(async (filter = historyFilter) => {
-    try {
-      const matches = await api.listMatches(filter)
-      setHistory(matches)
-    } catch (error) {
-      // A history that failed to load should not take the rest of the page
-      // down; the list simply stays as it was.
-      if (error?.status !== 401) setHistory([])
-    }
-  }, [historyFilter])
-
-  const loadVersions = useCallback(async () => {
-    setIsLoadingVersions(true)
-    try {
-      const list = await api.listResumes()
-
-      // The resume list carries no score, and the analysis list carries no file
-      // metadata. Merging them here means the version cards can show both
-      // without a request per version.
-      let scores = []
-      try {
-        scores = await api.listAnalyses()
-      } catch {
-        // Scores are a nicety on this screen; a failure here must not hide the
-        // versions themselves.
-      }
-
-      const byResume = new Map(scores.map((entry) => [String(entry.resumeId), entry]))
-
-      const merged = list.map((version) => {
-        const entry = byResume.get(String(version.id))
-        return entry ? { ...version, score: entry.score, verdict: entry.verdict } : version
-      })
-
-      setVersions(merged)
-      return merged
-    } catch (error) {
-      if (error?.status === 401) setVersions([])
-      return []
-    } finally {
-      setIsLoadingVersions(false)
-    }
-  }, [])
-
-  // Load the account's documents when a session starts. The signed-out half of
-  // this is handled by the event listeners below rather than here: clearing
-  // state synchronously in an effect body triggers a cascading render, and both
-  // ways of losing a session (signing out, and a 401 from the server) already
-  // announce themselves.
-  useEffect(() => {
-    if (!isAuthenticated) return
-
-    let cancelled = false
-
-    async function load() {
-      const list = await loadVersions()
-      if (cancelled || !list.length) return
-
-      // Open on the newest version so the dashboard is never empty after a
-      // reload, and pull its analysis without a second round-trip.
-      const [first] = list
-      setActiveId(first.id)
-      setResume(first)
+  /**
+   * Applies a change to the stored documents, and reports whether it landed.
+   *
+   * The only way they change. A failed write throws inside `update` and is caught
+   * here — and because nothing reached `localStorage`, the snapshot is unchanged
+   * and the screen still shows the last thing that really happened. The result is
+   * returned rather than only set on state, because a caller that just spent an
+   * AI call needs to know *now* whether the thing it paid for was saved.
+   *
+   * @returns {{ok: boolean, value?: object, error?: string}}
+   */
+  const commit = useCallback(
+    (updater) => {
+      if (!userId) return { ok: false, error: "Sign in to save changes." }
 
       try {
-        const full = await api.getAnalysis(first.id)
-        if (!cancelled) setAnalysis(full)
-      } catch {
-        if (!cancelled) setAnalysis(null)
+        const value = workspaceStore.update(userId, updater)
+        setStorageError(null)
+        return { ok: true, value }
+      } catch (error) {
+        setStorageError(error.message)
+        return { ok: false, error: error.message }
       }
+    },
+    [userId],
+  )
 
-      loadHistory()
-    }
+  /* ---------------------------------------------------------------- *
+   * Derived views
+   * ---------------------------------------------------------------- */
 
-    load()
+  const versions = useMemo(
+    () => workspaceStore.sortVersions(workspace.resumes).map(workspaceStore.toVersion),
+    [workspace.resumes],
+  )
 
-    return () => {
-      cancelled = true
-    }
-  }, [isAuthenticated, loadVersions, loadHistory])
+  const activeVersion = useMemo(
+    () => versions.find((version) => version.id === activeId) ?? null,
+    [versions, activeId],
+  )
 
-  // Losing the session drops the cached documents too, otherwise the next
-  // person to sign in on this browser would briefly see the previous one.
+  // The page reads a mapped analysis; the server needs the raw one. Both come out
+  // of the same stored object, so they cannot disagree.
+  const analysis = useMemo(
+    () => (activeVersion ? api.mapAnalysis(activeVersion.analysis, activeVersion) : null),
+    [activeVersion],
+  )
+
+  const history = useMemo(
+    () => workspaceStore.summariseMatches(workspace, historyFilter),
+    [workspace, historyFilter],
+  )
+
+  /* ---------------------------------------------------------------- *
+   * Losing the session
+   * ---------------------------------------------------------------- */
+
+  /**
+   * The documents are keyed to the account and swap out with it, so there is
+   * nothing to clear here. What does need clearing is the transient UI state —
+   * the match on screen, a half-finished comparison — which would otherwise be
+   * waiting when the next session opens.
+   *
+   * Both ways of losing a session — signing out, and a 401 from the server —
+   * announce themselves by firing this, and both handlers are registered in an
+   * effect because they are subscriptions to an external event, not work to do.
+   */
   useEffect(() => {
     function handleCleared() {
-      setVersions([])
       setActiveId(null)
-      setResume(null)
-      setAnalysis(null)
       setMatch(null)
-      setHistory([])
       setComparison(null)
       setAnalysisError(null)
       setMatchError(null)
       setImproveError(null)
+      setStorageError(null)
+      setAnalysingFileName(null)
     }
 
     window.addEventListener("intelme:data-cleared", handleCleared)
@@ -155,141 +151,169 @@ export function ResumeProvider({ children }) {
    * ---------------------------------------------------------------- */
 
   /**
-   * Uploads a file and runs its analysis. The filename is set immediately so the
-   * progress screen names the right file while the server is still working.
+   * Uploads a file, keeps what comes back, and analyses it.
+   *
+   * The version is written to storage before the analysis is announced, so a
+   * successful upload survives a reload even if the score never arrived.
    */
-  const analyze = useCallback(async (file, options = {}) => {
-    setIsAnalysing(true)
-    setAnalysisError(null)
+  const analyze = useCallback(
+    async (file, options = {}) => {
+      setIsAnalysing(true)
+      setAnalysingFileName(file.name)
+      setAnalysisError(null)
 
-    const optimistic = { name: file.name, size: file.size, type: (file.type || "").split("/").pop() }
-    setResume(optimistic)
+      try {
+        const result = await api.uploadResume(file, options)
 
-    try {
-      const result = await api.uploadResume(file, options)
-      const meta = result.resume ?? optimistic
+        if (!result.resume) {
+          // No text came back at all, so there is no version to keep.
+          setAnalysisError(result.reason ?? "That file could not be read.")
+          return null
+        }
 
-      setVersions((previous) => [
-        { ...meta, score: result.analysis?.atsScore, verdict: result.analysis?.verdict },
-        ...previous,
-      ])
-      setResume(meta)
-      setActiveId(meta.id)
+        const meta = api.mapResumeMeta(result.resume)
+        const id = workspaceStore.newId()
 
-      if (result.analysis) {
-        setAnalysis(result.analysis)
-        setAnalysisError(null)
-      } else {
-        // The file is stored and appears in the version list; only the analysis
-        // is missing, so say that rather than implying the upload was lost.
-        setAnalysis(null)
+        const record = {
+          id,
+          label: meta.label ?? "Main",
+          originalName: meta.name ?? file.name,
+          fileType: (result.resume.fileType ?? "").toLowerCase(),
+          fileSize: meta.size ?? file.size,
+          extractionMethod: meta.extractionMethod ?? null,
+          characters: meta.characters ?? 0,
+          // The text is the CV from here on: the server deleted the file, and
+          // this is what a re-run is made of.
+          extractedText: result.resume.extractedText ?? "",
+          createdAt: meta.createdAt ?? new Date().toISOString(),
+          analysis: result.analysis,
+        }
+
+        commit((previous) => ({ ...previous, resumes: [record, ...previous.resumes] }))
+        setActiveId(id)
+
+        if (!result.analysis) {
+          // The text was read fine, so the version exists and is usable; only the
+          // score is missing. Say that rather than implying the upload was lost.
+          setAnalysisError(
+            `${result.reason ?? "The analysis could not be completed."} Your file was read — use “Re-run analysis” to try again.`,
+          )
+        }
+
+        return result.analysis
+      } catch (error) {
         setAnalysisError(
-          `${result.reason ?? "The analysis could not be completed."} Your file was saved — use “Re-run analysis” to try again.`,
+          error?.message ?? "That file could not be read. Try exporting it as a plain PDF first.",
         )
+        return null
+      } finally {
+        setIsAnalysing(false)
+        setAnalysingFileName(null)
       }
+    },
+    [commit],
+  )
 
-      loadHistory()
-      return result.analysis
-    } catch (error) {
-      setAnalysisError(error?.message ?? "That file could not be read. Try exporting it as a plain PDF first.")
-      return null
-    } finally {
-      setIsAnalysing(false)
-    }
-  }, [loadHistory])
-
-  const selectVersion = useCallback(async (id) => {
-    if (!id || id === activeId) return
+  const selectVersion = useCallback((id) => {
+    if (!id) return
 
     setActiveId(id)
     setAnalysisError(null)
     setComparison(null)
-
-    const meta = versions.find((version) => version.id === id)
-    if (meta) setResume(meta)
-
-    try {
-      const full = await api.getAnalysis(id)
-      setResume((previous) => ({ ...(previous ?? {}), ...full }))
-      setAnalysis(full)
-    } catch (error) {
-      setAnalysis(null)
-      setAnalysisError(error?.message ?? "This version could not be loaded.")
-    }
-  }, [activeId, versions])
-
-  const reanalyse = useCallback(async () => {
-    if (!activeId) return null
-
-    setIsAnalysing(true)
-    setAnalysisError(null)
-
-    try {
-      const result = await api.reanalyse(activeId)
-      setAnalysis(result.analysis)
-      setVersions((previous) =>
-        previous.map((version) =>
-          version.id === activeId
-            ? { ...version, score: result.analysis?.atsScore, verdict: result.analysis?.verdict }
-            : version,
-        ),
-      )
-      return result.analysis
-    } catch (error) {
-      setAnalysisError(error?.message ?? "The analysis could not be refreshed.")
-      return null
-    } finally {
-      setIsAnalysing(false)
-    }
-  }, [activeId])
-
-  const renameVersion = useCallback(async (id, label) => {
-    const meta = await api.renameResume(id, label)
-    setVersions((previous) => previous.map((version) => (version.id === id ? { ...version, ...meta } : version)))
-    if (id === activeId) setResume((previous) => ({ ...(previous ?? {}), ...meta }))
-    return meta
-  }, [activeId])
+    // A match was scored against the version that was selected when it ran, so
+    // leaving it on screen after a switch would attribute it to the wrong CV.
+    setMatch(null)
+  }, [])
 
   /**
-   * Removes a version from the account, along with its file, its analyses and
-   * any job matches scored against it. The next version in the list is selected
-   * so the dashboard does not go blank.
+   * Re-runs the analysis on the text already stored for a version.
+   *
+   * The stored `analysis` is what the server needs in order to score this against
+   * a posting later, so the record's own object is what gets replaced — never
+   * the mapped display copy. `improvements` goes with it: this is a fresh read of
+   * the CV, and suggestions written against the previous one describe a state
+   * that no longer exists.
    */
-  const deleteVersion = useCallback(async (id) => {
-    const message = await api.deleteResume(id)
+  const reanalyse = useCallback(
+    async (id) => {
+      const versionId = id ?? activeId
+      const record = workspace.resumes.find((resume) => resume.id === versionId)
 
-    const remaining = versions.filter((version) => version.id !== id)
-    setVersions(remaining)
-
-    if (id === activeId) {
-      setActiveId(null)
-      setAnalysis(null)
-      setComparison(null)
-
-      if (remaining.length) {
-        const [next] = remaining
-        setActiveId(next.id)
-        setResume(next)
-        try {
-          setAnalysis(await api.getAnalysis(next.id))
-        } catch {
-          setAnalysis(null)
-        }
-      } else {
-        setResume(null)
+      if (!record || (record.extractedText ?? "").trim().length < MIN_TEXT_LENGTH) {
+        setAnalysisError("This resume has no readable text to analyse.")
+        return null
       }
-    }
 
-    loadHistory()
-    return message
-  }, [activeId, versions, loadHistory])
+      setIsAnalysing(true)
+      setAnalysingFileName(record.originalName)
+      setAnalysisError(null)
+
+      try {
+        const stored = await api.reanalyse(record.extractedText)
+
+        if (!stored) {
+          setAnalysisError("The analysis could not be refreshed. Try again in a moment.")
+          return null
+        }
+
+        commit((previous) => ({
+          ...previous,
+          resumes: previous.resumes.map((resume) =>
+            resume.id === versionId ? { ...resume, analysis: stored } : resume,
+          ),
+        }))
+
+        return stored
+      } catch (error) {
+        setAnalysisError(error?.message ?? "The analysis could not be refreshed.")
+        return null
+      } finally {
+        setIsAnalysing(false)
+        setAnalysingFileName(null)
+      }
+    },
+    [activeId, commit, workspace.resumes],
+  )
+
+  const renameVersion = useCallback(
+    (id, label) => {
+      const trimmed = String(label ?? "").trim()
+      if (!trimmed) return
+
+      commit((previous) => ({
+        ...previous,
+        resumes: previous.resumes.map((resume) =>
+          resume.id === id ? { ...resume, label: trimmed.slice(0, 60) } : resume,
+        ),
+      }))
+    },
+    [commit],
+  )
 
   /**
-   * "Reset" is the dashboard's remove button. Versions are persisted now, so
-   * this deletes the selected one rather than just forgetting it locally.
+   * Removes a version from this browser, along with any match scored against it.
+   * The next version in the list is selected so the dashboard does not go blank.
    */
+  const deleteVersion = useCallback(
+    (id) => {
+      const remaining = workspaceStore.sortVersions(
+        workspace.resumes.filter((resume) => resume.id !== id),
+      )
+
+      commit((previous) => workspaceStore.removeResume(previous, id))
+
+      if (id === activeId) {
+        setActiveId(remaining[0]?.id ?? null)
+        setComparison(null)
+        setMatch(null)
+      }
+    },
+    [activeId, commit, workspace.resumes],
+  )
+
+  /** The dashboard's remove button. */
   const reset = useCallback(async () => {
-    if (activeId) await deleteVersion(activeId)
+    if (activeId) deleteVersion(activeId)
   }, [activeId, deleteVersion])
 
   /* ---------------------------------------------------------------- *
@@ -297,7 +321,9 @@ export function ResumeProvider({ children }) {
    * ---------------------------------------------------------------- */
 
   const improve = useCallback(async () => {
-    if (!activeId) {
+    const record = workspace.resumes.find((resume) => resume.id === activeId)
+
+    if (!record?.analysis) {
       setImproveError("Upload a CV first.")
       return null
     }
@@ -306,10 +332,19 @@ export function ResumeProvider({ children }) {
     setImproveError(null)
 
     try {
-      const improvements = await api.improveCv(activeId)
-      // The suggestions are persisted against the analysis, so keep the cached
-      // copy in step and the panel survives a reload.
-      setAnalysis((previous) => (previous ? { ...previous, improvements } : previous))
+      const improvements = await api.improveCv(record.analysis)
+
+      // Written onto the stored analysis, so the panel survives a reload and the
+      // server has it the next time this analysis is used.
+      commit((previous) => ({
+        ...previous,
+        resumes: previous.resumes.map((resume) =>
+          resume.id === activeId
+            ? { ...resume, analysis: { ...resume.analysis, improvements } }
+            : resume,
+        ),
+      }))
+
       return improvements
     } catch (error) {
       setImproveError(error?.message ?? "Suggestions could not be generated. Try again in a moment.")
@@ -317,31 +352,44 @@ export function ResumeProvider({ children }) {
     } finally {
       setIsImproving(false)
     }
-  }, [activeId])
+  }, [activeId, commit, workspace.resumes])
 
   /* ---------------------------------------------------------------- *
    * Comparison
    * ---------------------------------------------------------------- */
 
-  const compare = useCallback(async (resumeIds) => {
-    if (resumeIds.length < 2) {
-      setComparison(null)
-      return null
-    }
+  const compare = useCallback(
+    async (ids) => {
+      if (ids.length < 2) {
+        setComparison(null)
+        return null
+      }
 
-    setIsComparing(true)
-    try {
-      const result = await api.compareVersions(resumeIds)
-      setComparison(result)
-      return result
-    } catch (error) {
-      setComparison(null)
-      setAnalysisError(error?.message ?? "Those versions could not be compared.")
-      return null
-    } finally {
-      setIsComparing(false)
-    }
-  }, [])
+      const chosen = ids
+        .map((id) => workspace.resumes.find((resume) => resume.id === id))
+        .filter((resume) => resume?.analysis)
+
+      if (chosen.length < 2) {
+        setComparison(null)
+        setAnalysisError("Those versions could not be compared — one of them has no analysis yet.")
+        return null
+      }
+
+      setIsComparing(true)
+      try {
+        const result = await api.compareVersions(chosen)
+        setComparison(result)
+        return result
+      } catch (error) {
+        setComparison(null)
+        setAnalysisError(error?.message ?? "Those versions could not be compared.")
+        return null
+      } finally {
+        setIsComparing(false)
+      }
+    },
+    [workspace.resumes],
+  )
 
   const clearComparison = useCallback(() => setComparison(null), [])
 
@@ -350,7 +398,9 @@ export function ResumeProvider({ children }) {
    * ---------------------------------------------------------------- */
 
   const runMatch = useCallback(async () => {
-    if (!activeId) {
+    const record = workspace.resumes.find((resume) => resume.id === activeId)
+
+    if (!record?.analysis) {
       setMatchError("Upload a resume first so there is something to compare against.")
       return null
     }
@@ -364,12 +414,27 @@ export function ResumeProvider({ children }) {
     setMatchError(null)
 
     try {
-      const job = await api.createMatch({ resumeId: activeId, jobDescription })
-      // The extras panel needs the CV's own skills, which only the selected
-      // analysis has.
-      const result = mapWithExtras(job, analysis)
+      // The candidate side of the comparison is the stored analysis, sent as-is.
+      const job = await api.createMatch({
+        analysis: record.analysis,
+        resumeId: activeId,
+        jobDescription,
+      })
+
+      const saved = commit((previous) => ({ ...previous, matches: [job, ...previous.matches] }))
+
+      if (!saved.ok) {
+        // The score came back but there is nowhere to put it. Saying so beats
+        // showing a match that the next reload would forget.
+        setMatch(null)
+        setMatchError(saved.error)
+        return null
+      }
+
+      // The extras panel needs the CV's own skills, which only the mapped
+      // analysis exposes.
+      const result = api.toMatchResult(job, analysis)
       setMatch(result)
-      loadHistory()
       return result
     } catch (error) {
       setMatch(null)
@@ -378,66 +443,100 @@ export function ResumeProvider({ children }) {
     } finally {
       setIsMatching(false)
     }
-  }, [activeId, analysis, jobDescription, loadHistory])
+  }, [activeId, analysis, commit, jobDescription, workspace.resumes])
 
   const clearMatch = useCallback(() => {
     setMatch(null)
     setMatchError(null)
   }, [])
 
-  const openHistoryMatch = useCallback(async (id) => {
-    setMatchError(null)
-    try {
-      const job = await api.getMatch(id)
-      const result = mapWithExtras(job, analysis)
+  /** Opens a saved match. It is already here — there is nothing to fetch. */
+  const openHistoryMatch = useCallback(
+    (id) => {
+      const job = workspace.matches.find((entry) => entry.id === id)
+
+      if (!job) {
+        setMatchError("That match is no longer saved in this browser.")
+        return null
+      }
+
+      const result = api.toMatchResult(job, analysis)
+      setMatchError(null)
       setMatch(result)
       return result
-    } catch (error) {
-      setMatchError(error?.message ?? "That match could not be opened.")
-      return null
-    }
-  }, [analysis])
+    },
+    [analysis, workspace.matches],
+  )
 
-  const deleteHistoryMatch = useCallback(async (id) => {
-    await api.deleteMatch(id)
-    setHistory((previous) => previous.filter((entry) => entry.id !== id))
-    setMatch((previous) => (previous?.id === id ? null : previous))
-  }, [])
+  const deleteHistoryMatch = useCallback(
+    (id) => {
+      commit((previous) => ({
+        ...previous,
+        matches: previous.matches.filter((entry) => entry.id !== id),
+      }))
 
-  const clearHistory = useCallback(async () => {
-    await api.clearMatches()
-    setHistory([])
+      setMatch((previous) => (previous?.id === id ? null : previous))
+    },
+    [commit],
+  )
+
+  const clearHistory = useCallback(() => {
+    commit((previous) => ({ ...previous, matches: [] }))
     setMatch(null)
-  }, [])
+  }, [commit])
 
   const applyHistoryFilter = useCallback((next) => {
     setHistoryFilter((previous) => ({ ...previous, ...next }))
-    loadHistory({ ...historyFilter, ...next })
-  }, [historyFilter, loadHistory])
+  }, [])
+
+  /** The history is derived from storage, so "refresh" has nothing to do. */
+  const refreshHistory = useCallback(async () => undefined, [])
 
   const requirements = useMemo(
     () => api.extractJobRequirements(jobDescription),
     [jobDescription],
   )
 
+  /**
+   * Wipes this account's documents from this browser, leaving the account itself
+   * alone. The server holds nothing to wipe, so this is the only place that copy
+   * can be destroyed.
+   */
+  const clearLocalData = useCallback(() => {
+    if (!userId) return
+
+    workspaceStore.clear(userId)
+    setActiveId(null)
+    setMatch(null)
+    setComparison(null)
+    setAnalysisError(null)
+    setMatchError(null)
+    setStorageError(null)
+  }, [userId])
+
   const value = useMemo(
     () => ({
       // versions
       versions,
       activeId,
-      isLoadingVersions,
       selectVersion,
       renameVersion,
       deleteVersion,
       reanalyse,
 
       // the selected version
-      resume,
+      resume: activeVersion,
       analysis,
       isAnalysing,
+      analysingFileName,
       analysisError,
       analyze,
       reset,
+
+      // this browser's own storage
+      storageError,
+      localStorageUsed,
+      clearLocalData,
 
       // improve my CV
       improve,
@@ -468,22 +567,25 @@ export function ResumeProvider({ children }) {
       openHistoryMatch,
       deleteHistoryMatch,
       clearHistory,
-      refreshHistory: loadHistory,
+      refreshHistory,
     }),
     [
       versions,
       activeId,
-      isLoadingVersions,
       selectVersion,
       renameVersion,
       deleteVersion,
       reanalyse,
-      resume,
+      activeVersion,
       analysis,
       isAnalysing,
+      analysingFileName,
       analysisError,
       analyze,
       reset,
+      storageError,
+      localStorageUsed,
+      clearLocalData,
       improve,
       isImproving,
       improveError,
@@ -504,20 +606,11 @@ export function ResumeProvider({ children }) {
       openHistoryMatch,
       deleteHistoryMatch,
       clearHistory,
-      loadHistory,
+      refreshHistory,
     ],
   )
 
   return <ResumeContext.Provider value={value}>{children}</ResumeContext.Provider>
-}
-
-/**
- * `mapMatch` is private to the API module because the extras list depends on the
- * selected analysis, which only this provider holds. Re-exporting it here keeps
- * the components free of mapping code.
- */
-function mapWithExtras(job, analysis) {
-  return api.toMatchResult(job, analysis)
 }
 
 export function useResume() {

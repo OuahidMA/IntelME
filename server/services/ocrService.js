@@ -4,8 +4,6 @@ import mammoth from "mammoth";
 import { PDFParse } from "pdf-parse";
 import { createWorker } from "tesseract.js";
 
-import { EXTRACTION_METHOD } from "../models/Resume.js";
-
 /**
  * Recovers plain text from an uploaded resume.
  *
@@ -16,7 +14,20 @@ import { EXTRACTION_METHOD } from "../models/Resume.js";
  *      read with Tesseract.
  *
  * .docx is a zip of XML, so mammoth reads it directly with no OCR step.
+ *
+ * This vocabulary lives here rather than in a model because nothing here is
+ * persisted any more: the method is a property of the parse that just happened,
+ * reported to the browser alongside the text, and there is no document to hang a
+ * `status` or a stored `extractionMethod` field on.
  */
+
+/** How the text was recovered from the file. */
+export const EXTRACTION_METHOD = {
+  TEXT: "text",
+  OCR: "ocr",
+  HYBRID: "hybrid",
+  FAILED: "failed",
+};
 
 /** Below this many letters we assume the document is a scan, not real text. */
 const OCR_FALLBACK_THRESHOLD = 200;

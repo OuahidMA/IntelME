@@ -8,10 +8,6 @@ import "dotenv/config";
 const modules = [
   "../config/db.js",
   "../models/User.js",
-  "../models/Resume.js",
-  "../models/Analysis.js",
-  "../models/Job.js",
-  "../models/scoreBreakdown.js",
   "../utils/jwt.js",
   "../utils/validators.js",
   "../utils/dates.js",
@@ -20,7 +16,6 @@ const modules = [
   "../middleware/uploadMiddleware.js",
   "../services/aiService.js",
   "../services/ocrService.js",
-  "../services/accountService.js",
   "../services/documentService.js",
   "../services/scoringService.js",
   "../services/matchingService.js",

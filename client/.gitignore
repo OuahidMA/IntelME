@@ -12,6 +12,14 @@ dist
 dist-ssr
 *.local
 
+# Real environment files. `.env.example` is committed on purpose — it is the
+# documentation — and the mode-specific `.env.production` style files are not
+# ignored either, since those are the intended way to commit a *public* setting.
+# What must never be committed is a machine-specific value or a secret.
+.env
+.env.local
+.env.*.local
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

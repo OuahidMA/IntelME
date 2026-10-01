@@ -2,7 +2,7 @@
   "name": "intelme-server",
   "version": "1.0.0",
   "private": true,
-  "description": "REST API for intelme: auth, resume OCR extraction, AI analysis, scoring and job matching.",
+  "description": "REST API for intelme: auth, and the stateless resume parsing, AI analysis, scoring and job matching that run server-side. The database holds account details only — CVs live in the user's browser.",
   "type": "module",
   "main": "server.js",
   "scripts": {

@@ -1,15 +1,6 @@
 import { useState } from "react"
 import { Link } from "react-router-dom"
-import {
-  Columns3,
-  Download,
-  FileText,
-  Pencil,
-  ScanText,
-  Sparkles,
-  Target,
-  Trash2,
-} from "lucide-react"
+import { Columns3, FileText, Pencil, ScanText, Sparkles, Target, Trash2 } from "lucide-react"
 
 import { LoadingAnalysis } from "@/components/LoadingAnalysis"
 import { ResumeUploader } from "@/components/ResumeUploader"
@@ -241,7 +232,7 @@ function ComparePanel({ versions, selected, onRun, onClear, comparison, isCompar
 }
 
 function CurrentResume() {
-  const { resume, analysis, activeId, downloadResume } = useResume()
+  const { resume, analysis } = useResume()
 
   return (
     <Card className="gap-6">
@@ -282,17 +273,6 @@ function CurrentResume() {
             <Target data-icon="inline-start" />
             Score a job
           </Button>
-          {activeId && (
-            <Button
-              size="sm"
-              variant="ghost"
-              className="ml-auto text-muted-foreground"
-              onClick={() => downloadResume(activeId, resume?.name)}
-            >
-              <Download data-icon="inline-start" />
-              Download original
-            </Button>
-          )}
         </div>
       </CardContent>
     </Card>
@@ -303,12 +283,12 @@ export default function Dashboard() {
   const {
     analysis,
     isAnalysing,
+    analysingFileName,
     analysisError,
+    storageError,
     analyze,
-    resume,
     versions,
     activeId,
-    isLoadingVersions,
     selectVersion,
     compare,
     comparison,
@@ -320,7 +300,7 @@ export default function Dashboard() {
   if (isAnalysing) {
     return (
       <div className="mx-auto grid w-full max-w-3xl gap-6">
-        <LoadingAnalysis fileName={resume?.name} />
+        <LoadingAnalysis fileName={analysingFileName} />
       </div>
     )
   }
@@ -336,10 +316,17 @@ export default function Dashboard() {
       <div className="grid gap-1">
         <h2 className="text-2xl font-semibold tracking-[-0.9px]">Your resume versions</h2>
         <p className="text-muted-foreground">
-          Upload the CV you plan to send. Every version is stored on your account, so
-          you can tailor a copy per role and compare them.
+          Upload the CV you plan to send. Every version is kept in this browser only —
+          tailor a copy per role and compare them.
         </p>
       </div>
+
+      {storageError && (
+        <Alert variant="destructive">
+          <AlertTitle>Not saved</AlertTitle>
+          <AlertDescription>{storageError}</AlertDescription>
+        </Alert>
+      )}
 
       {analysisError && (
         <Alert variant="destructive">
@@ -395,10 +382,6 @@ export default function Dashboard() {
           <ResumeUploader onSubmit={analyze} isSubmitting={isAnalysing} />
         </CardContent>
       </Card>
-
-      {isLoadingVersions && (
-        <p className="text-center text-sm text-muted-foreground">Loading your versions…</p>
-      )}
     </div>
   )
 }
