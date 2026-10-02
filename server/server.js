@@ -65,12 +65,47 @@ app.use("/api/resumes", resumeRoutes);
 app.use("/api/analysis", analysisRoutes);
 app.use("/api/jobs", jobRoutes);
 
+// Root route - shows server is running when accessed in browser
+app.get("/", (_req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Server Running</title>
+        <style>
+          body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f5f5f5; }
+          .container { text-align: center; padding: 2rem; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+          h1 { color: #22c55e; margin: 0; }
+          p { color: #666; margin-top: 0.5rem; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>✓ Server is running</h1>
+          <p>API is operational</p>
+        </div>
+      </body>
+    </html>
+  `);
+});
+
 app.use(notFound);
 app.use(errorHandler);
 
 /* ------------------------------------------------------------------ *
  * Boot
  * ------------------------------------------------------------------ */
+
+const isServerless = Boolean(
+  process.env.VERCEL ||
+    process.env.NETLIFY ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.FUNCTIONS ||
+    process.env.CLOUD_FUNCTION ||
+    process.env.WORKER_ENV ||
+    process.env.FLY_REGION === "iad" && process.env.FLY_APP_NAME // not exactly, but better to be safe
+);
 
 async function start() {
   try {
@@ -86,15 +121,26 @@ async function start() {
   }
 }
 
-process.on("unhandledRejection", (reason) => {
-  console.error("[api] unhandled rejection:", reason);
-});
+// In serverless environments, don't listen - just export the app
+// Also handle DB connection more gracefully for cold starts
+if (!isServerless) {
+  process.on("unhandledRejection", (reason) => {
+    console.error("[api] unhandled rejection:", reason);
+  });
 
-process.on("SIGTERM", () => {
-  console.log("[api] shutting down");
-  process.exit(0);
-});
+  process.on("SIGTERM", () => {
+    console.log("[api] shutting down");
+    process.exit(0);
+  });
 
-start();
+  start();
+} else {
+  // For serverless, connect DB on first request if needed
+  // but we export app immediately; many platforms handle this
+  // Pre-connect to reduce cold start time where possible
+  connectDB().catch((error) => {
+    console.error("[api] failed to connect to database:", error.message);
+  });
+}
 
 export default app;
