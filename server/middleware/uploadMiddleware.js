@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -7,10 +8,23 @@ import multer from "multer";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-/** server/uploads — git-ignored, never served statically. */
-export const UPLOAD_DIR = path.resolve(__dirname, "..", "uploads");
+const isServerless = Boolean(
+  process.env.VERCEL || process.env.VERCEL_ENV || process.env.AWS_LAMBDA_FUNCTION_NAME,
+);
 
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+/**
+ * server/uploads — git-ignored, never served statically.
+ *
+ * On a serverless runtime the bundle's own directory is mounted read-only, so
+ * creating a folder beside the code fails with EROFS. The OS temp directory is
+ * the writable path such a runtime provides (`/tmp` on Vercel), and it is
+ * per-instance — which is the right lifetime here anyway, because an upload is
+ * parsed within the request that received it and deleted straight after (see
+ * `removeStoredFile`).
+ */
+export const UPLOAD_DIR = isServerless
+  ? path.join(os.tmpdir(), "uploads")
+  : path.resolve(__dirname, "..", "uploads");
 
 export const MAX_FILE_SIZE_MB = Number.parseInt(process.env.MAX_FILE_SIZE_MB, 10) || 5;
 export const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
@@ -38,7 +52,10 @@ export function getExtension(filename) {
 
 const storage = multer.diskStorage({
   destination(_req, _file, cb) {
-    cb(null, UPLOAD_DIR);
+    // Created here rather than at import time. A module-scope mkdirSync looks
+    // harmless but runs on every cold start, so on a read-only bundle it throws
+    // before Express ever sees a request and takes the whole API down with it.
+    fs.mkdir(UPLOAD_DIR, { recursive: true }, (error) => cb(error, UPLOAD_DIR));
   },
   filename(_req, file, cb) {
     // The stored name is generated, never derived from the client's filename:
