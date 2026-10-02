@@ -1,8 +1,27 @@
 import fs from "node:fs/promises";
 
-import mammoth from "mammoth";
-import { PDFParse } from "pdf-parse";
-import { createWorker } from "tesseract.js";
+/**
+ * The parsing stack, resolved on first use instead of at import time.
+ *
+ * `pdf-parse` rasterises through `@napi-rs/canvas`, a native module with
+ * per-platform binaries, and `tesseract.js` carries a multi-megabyte wasm core.
+ * Importing them at module scope puts all of that in the cold-start path of
+ * *every* request, including `/api/health`. A binary that is absent or built for
+ * the wrong platform then fails the whole module graph, and the API returns
+ * nothing at all rather than just losing OCR — which is what happened when this
+ * was built on Windows and deployed to Linux.
+ *
+ * Deferring them means the failure is confined to the upload that needed it, and
+ * the promises are cached so a warm container pays the cost exactly once.
+ */
+function once(load) {
+  let promise;
+  return () => (promise ??= load());
+}
+
+const loadPdfParse = once(() => import("pdf-parse").then((m) => m.PDFParse));
+const loadCreateWorker = once(() => import("tesseract.js").then((m) => m.createWorker));
+const loadMammoth = once(() => import("mammoth").then((m) => m.default ?? m));
 
 /**
  * Recovers plain text from an uploaded resume.
@@ -93,6 +112,7 @@ async function readBuffer(filePath) {
 
 /** Step 1: the text layer a PDF already contains. */
 async function extractPdfText(buffer) {
+  const PDFParse = await loadPdfParse();
   const parser = new PDFParse({ data: new Uint8Array(buffer) });
 
   try {
@@ -106,6 +126,7 @@ async function extractPdfText(buffer) {
 
 /** Step 2: rasterise pages and read them with Tesseract. */
 async function ocrPdfPages(buffer) {
+  const [PDFParse, createWorker] = await Promise.all([loadPdfParse(), loadCreateWorker()]);
   const parser = new PDFParse({ data: new Uint8Array(buffer) });
   let worker;
 
@@ -136,12 +157,14 @@ async function ocrPdfPages(buffer) {
 }
 
 async function extractDocxText(buffer) {
+  const mammoth = await loadMammoth();
   const result = await mammoth.extractRawText({ buffer });
 
   return normaliseText(result?.value ?? "");
 }
 
 async function ocrImageBuffer(buffer) {
+  const createWorker = await loadCreateWorker();
   const worker = await createWorker("eng");
 
   try {
