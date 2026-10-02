@@ -74,11 +74,12 @@ export function allowedOrigins(env = process.env) {
 }
 
 /**
- * A predicate suitable for `cors({ origin })`.
+ * A predicate suitable for testing an origin against this deployment.
  *
- * Returning `false` makes `cors` omit the header entirely rather than echoing a
- * refused origin back — which is the property the browser actually enforces, and
- * the one the HTTP suite asserts.
+ * Note this is *not* something to hand to `cors({ origin })`: that option treats
+ * a function as an async delegate called as `(origin, callback)`, so a
+ * synchronous predicate passed there is never able to call back and every
+ * request hangs. Use `createOriginPattern` for the middleware.
  *
  * A missing `Origin` header is allowed: same-origin, `curl` and server-to-server
  * calls do not send one, and they are not subject to CORS, so refusing them would
@@ -93,6 +94,50 @@ export function createOriginChecker(env = process.env) {
     const candidate = origin.replace(/\/+$/, "");
     return matchers.some((matches) => matches(candidate));
   };
+}
+
+/** An allowlist entry as a regular expression source fragment. */
+function originSource(entry) {
+  const value = String(entry ?? "").trim().replace(/\/+$/, "");
+  if (!value) return null;
+
+  if (!value.includes("*")) return escapeRegExp(value);
+
+  if (value.split("*").length - 1 > 1) {
+    console.warn(`[cors] ignoring "${value}": only one "*" is supported`);
+    return null;
+  }
+
+  return value.split("*").map(escapeRegExp).join("[^.]*");
+}
+
+/**
+ * The allowlist as one `RegExp`, which is the shape `cors` actually needs.
+ *
+ * This exists because of how `cors` treats each of its `origin` types:
+ *
+ *   - a function is an async delegate, `(origin, cb) => cb(null, value)`. A
+ *     synchronous predicate is never called back, so nothing is answered and the
+ *     request times out — which is what a function here used to cause.
+ *   - `false` or a falsy value is read as "allow any origin" and answered with
+ *     `Access-Control-Allow-Origin: *`, the opposite of refusing.
+ *   - a `RegExp` is the only form that both reflects an allowed origin and omits
+ *     the header entirely for a refused one, which is the property the browser
+ *     actually enforces.
+ *
+ * Non-browser callers send no `Origin`, so nothing matches and they get no CORS
+ * headers at all rather than an accidental `*`.
+ */
+export function buildOriginPattern(env = process.env) {
+  const sources = allowedOrigins(env).map(originSource).filter(Boolean);
+
+  // Never an empty pattern: an empty alternation would match every origin.
+  return new RegExp(sources.length ? `^(?:${sources.join("|")})$` : "a^");
+}
+
+/** The allowlist as a single `RegExp`, for `cors({ origin })`. */
+export function createOriginPattern(env = process.env) {
+  return buildOriginPattern(env);
 }
 
 export default createOriginChecker;

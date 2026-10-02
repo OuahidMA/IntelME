@@ -3,8 +3,8 @@ import "dotenv/config";
 import cors from "cors";
 import express from "express";
 
-import { connectDB } from "./config/db.js";
-import { allowedOrigins, createOriginChecker } from "./config/cors.js";
+import { connectDB, ensureDB } from "./config/db.js";
+import { allowedOrigins, createOriginPattern } from "./config/cors.js";
 import { errorHandler, notFound } from "./middleware/errorMiddleware.js";
 import analysisRoutes from "./routes/analysisRoutes.js";
 import authRoutes, { ping } from "./routes/authRoutes.js";
@@ -22,8 +22,12 @@ const PORT = Number.parseInt(process.env.PORT, 10) || 5000;
  * break `npm run dev`; a Vercel preview can be allowed with a single `*`, e.g.
  * `https://*.vercel.app`. The rules and the reasoning behind them are in
  * `config/cors.js`.
+ *
+ * This has to be a pattern and not a predicate: `cors` calls a function `origin`
+ * as an async delegate, so passing a synchronous one leaves every request without
+ * a response.
  */
-const isAllowedOrigin = createOriginChecker();
+const allowedOrigin = createOriginPattern();
 
 /* ------------------------------------------------------------------ *
  * Security
@@ -32,10 +36,11 @@ const isAllowedOrigin = createOriginChecker();
 // Only allowlisted origins get a response the browser will accept. `credentials:
 // true` keeps cookies off other origins; the app authenticates with a bearer
 // token, but leaving the default in place means this stays correct if that ever
-// changes.
+// changes. The pattern reflects an allowed origin and omits the header for a
+// refused one.
 app.use(
   cors({
-    origin: isAllowedOrigin,
+    origin: allowedOrigin,
     credentials: true,
     methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -53,6 +58,54 @@ app.disable("x-powered-by");
  * Routes
  * ------------------------------------------------------------------ */
 
+// The landing page answers from the module itself, so it stays up even when the
+// database is unreachable — which is the whole point of using it to check
+// whether the deployment is alive.
+app.get("/", (_req, res) => {
+  res.type("html").send(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>intelme api</title>
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font: 16px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
+        background: #0b0d10;
+        color: #e6e8eb;
+      }
+      main { text-align: center; padding: 2rem; }
+      h1 { margin: 0 0 .5rem; font-size: 1.5rem; font-weight: 600; }
+      h1::before { content: "\\2713"; color: #3ddc84; margin-right: .5rem; }
+      p { margin: 0; color: #8b9299; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Server is running</h1>
+      <p>intelme api &middot; <code>/api/health</code> &middot; <code>/api/ping</code></p>
+    </main>
+  </body>
+</html>`);
+});
+
+// Every route below reads or writes MongoDB. Opening the connection here, on
+// the first request, is what keeps a cold start from timing out before Express
+// is even invoked. `ensureDB` caches its promise, so the requests that arrive
+// while the handshake is in flight all await the same one.
+app.use(async (_req, res, next) => {
+  try {
+    await ensureDB();
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/health", (_req, res) => {
   res.json({ success: true, status: "ok", uptime: Math.round(process.uptime()) });
 });
@@ -65,31 +118,6 @@ app.use("/api/resumes", resumeRoutes);
 app.use("/api/analysis", analysisRoutes);
 app.use("/api/jobs", jobRoutes);
 
-// Root route - shows server is running when accessed in browser
-app.get("/", (_req, res) => {
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <title>Server Running</title>
-        <style>
-          body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f5f5f5; }
-          .container { text-align: center; padding: 2rem; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-          h1 { color: #22c55e; margin: 0; }
-          p { color: #666; margin-top: 0.5rem; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h1>✓ Server is running</h1>
-          <p>API is operational</p>
-        </div>
-      </body>
-    </html>
-  `);
-});
-
 app.use(notFound);
 app.use(errorHandler);
 
@@ -97,16 +125,12 @@ app.use(errorHandler);
  * Boot
  * ------------------------------------------------------------------ */
 
-const isServerless = Boolean(
-  process.env.VERCEL ||
-    process.env.NETLIFY ||
-    process.env.AWS_LAMBDA_FUNCTION_NAME ||
-    process.env.FUNCTIONS ||
-    process.env.CLOUD_FUNCTION ||
-    process.env.WORKER_ENV ||
-    process.env.FLY_REGION === "iad" && process.env.FLY_APP_NAME // not exactly, but better to be safe
-);
-
+/**
+ * Opens the connection, then listens.
+ *
+ * The order matters locally: binding the port first would accept a request
+ * before there is a database behind it.
+ */
 async function start() {
   try {
     await connectDB();
@@ -121,26 +145,35 @@ async function start() {
   }
 }
 
-// In serverless environments, don't listen - just export the app
-// Also handle DB connection more gracefully for cold starts
-if (!isServerless) {
-  process.on("unhandledRejection", (reason) => {
-    console.error("[api] unhandled rejection:", reason);
-  });
+/**
+ * Whether this process owns its HTTP server.
+ *
+ * Under a serverless runtime the platform invokes the exported app and
+ * terminates the sandbox afterwards, so binding a port both fails and hides the
+ * real error. `VERCEL` is the flag Vercel sets on every function; the others
+ * cover the other runtimes an Express app of this shape tends to land on.
+ * `VERCEL_ENV` is checked too because it is set during the build, when binding a
+ * port is equally wrong.
+ */
+const isServerless = Boolean(
+  process.env.VERCEL || process.env.VERCEL_ENV || process.env.AWS_LAMBDA_FUNCTION_NAME,
+);
 
-  process.on("SIGTERM", () => {
-    console.log("[api] shutting down");
-    process.exit(0);
-  });
+process.on("unhandledRejection", (reason) => {
+  console.error("[api] unhandled rejection:", reason);
+});
 
-  start();
+process.on("SIGTERM", () => {
+  console.log("[api] shutting down");
+  process.exit(0);
+});
+
+if (isServerless) {
+  // Nothing to start. The first request opens the connection through the
+  // `ensureDB` middleware above.
+  console.log("[api] serverless mode: exporting app, deferring database connect");
 } else {
-  // For serverless, connect DB on first request if needed
-  // but we export app immediately; many platforms handle this
-  // Pre-connect to reduce cold start time where possible
-  connectDB().catch((error) => {
-    console.error("[api] failed to connect to database:", error.message);
-  });
+  start();
 }
 
 export default app;
