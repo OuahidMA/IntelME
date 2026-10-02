@@ -148,7 +148,7 @@ function HeroPreview() {
         <div className="grid place-content-center gap-3 border-b border-border bg-secondary/50 p-6 md:border-r md:border-b-0">
           <ScoreRing value={84} label="ATS score" />
           <p className="max-w-36 text-center text-xs text-muted-foreground">
-            Clear sections and scannable layout. Close two keyword gaps to reach the 90s.
+            Well formatted and concise, a few structural fixes will push this to the 90 mark.
           </p>
         </div>
 
